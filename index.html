@@ -1,0 +1,4665 @@
+<!doctype html>
+<!--
+  ======================================================================
+  PDF Redactor — single-file, browser-only, content-stream-level redaction
+  ======================================================================
+
+  What this is
+  ------------
+  A self-contained HTML page that lets a user redact sensitive content
+  from a PDF without uploading anything. Two libraries are vendored next
+  to the page (./vendor/) — pdfjs-dist for rendering and reading text,
+  pdf-lib for serializing the modified PDF — so the tool runs offline
+  after the initial download. A CSP meta tag (below) blocks any
+  third-party fetch at runtime.
+
+  How redaction works (the part most viewers will be curious about)
+  -----------------------------------------------------------------
+  Most browser "redactors" paint a black rectangle on top of the text
+  and call it done — the text is still in the file, copy-pasteable. This
+  tool actually rewrites the page's content stream:
+
+   1. Parse the page Contents byte-by-byte (walkAndBlank, below).
+   2. Track the text-positioning state (CTM stack, text matrix, font,
+      font size) so each glyph's user-space bbox can be computed.
+   3. For every Tj / TJ text-show operator, look up the active font's
+      per-glyph widths (from /Widths or /W) and walk glyph by glyph.
+      Glyphs whose bbox sits inside a redaction rect are removed; the
+      rest are kept and the cursor advance is preserved via TJ kerning
+      so surrounding text stays positioned correctly.
+   4. After surgery, append black rectangle drawing operators in
+      user space so the redacted regions are visually marked.
+   5. Verify by re-parsing the exported PDF with pdfjs and counting any
+      text item still inside a redaction rect (zero is success).
+
+  File layout
+  -----------
+   <head>      — CSP, fonts, and all CSS (TOKENS / HEADER / HERO / DROP
+                 ZONE / SETTINGS / WORKSPACE / PAGES / RECTS / DIALOG /
+                 PROOF / TAKE-IT-HOME / FOOTER / TOAST sections).
+   <body>      — header, hero+drop, sticky control bar, page viewport,
+                 proof section, take-it-home cards, footer, dialogs.
+   <script>    — module: state, file load, render, drag/draw rectangles,
+                 auto-detect (regex pack + custom user patterns),
+                 export (content-stream surgery + verify), theme/toast.
+
+  Vendoring
+  ---------
+   ./vendor/pdf.min.mjs             pdfjs-dist 4.7.76 main module
+   ./vendor/pdf.worker.min.mjs      pdfjs-dist 4.7.76 worker
+   ./vendor/pdf-lib.min.mjs         pdf-lib 1.17.1 (ESM)
+
+  License: MIT. Source: github.com/xjmani/pdf-redactor.
+-->
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<!--
+  Content-Security-Policy. Locks the page down so it cannot fetch JS,
+  workers, or backends from anywhere except this origin. Google Fonts
+  is the only outside host allowed (style + font files); if it's
+  unreachable, the page falls back to system fonts cleanly.
+  · script-src 'self'   — blocks any third-party JS injection.
+  · connect-src 'self'  — no fetch / XHR can leave the origin, which
+                          is what makes the "zero uploads" claim
+                          verifiable in DevTools.
+  · worker-src 'self' blob:
+                        — allows the vendored pdf.worker file plus
+                          pdfjs's blob-based worker fallback.
+  · 'unsafe-eval'       — pdfjs and pdf-lib both use Function() at
+                          runtime for font / Type1 parsing.
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; worker-src 'self' blob:; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self';" />
+<meta name="theme-color" content="#08090a" />
+<meta name="color-scheme" content="dark light" />
+<title>PDF Redactor · xjmani</title>
+<meta name="description" content="Redact sensitive content from PDFs in your browser. Text outside redactions stays selectable and searchable. Nothing is uploaded." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+  /* ==========================================================
+     TOKENS, lifted from xjmani.com
+     ========================================================== */
+  :root {
+    --bg:        #08090a;
+    --bg-raised: #0f1012;
+    --bg-card:   #131416;
+    --surface:   #1a1b1e;
+    --border:    rgba(255,255,255,.06);
+    --border-hover: rgba(255,255,255,.12);
+    --text:      #e4e4e7;
+    --text-dim:  #a1a1aa;
+    --text-mute: #52525b;
+    --green:     #22c55e;
+    --green-dim: rgba(34,197,94,.15);
+    --green-glow:rgba(34,197,94,.25);
+    --purple:    #a78bfa;
+    --purple-dim:rgba(167,139,250,.12);
+    --yellow:    #ffca00;
+    --yellow-dim:rgba(255,202,0,.12);
+    --red:       #f87171;
+    --red-dim:   rgba(248,113,113,.14);
+    --amber:     #fbbf24;
+    --white:     #fafafa;
+
+    --font-body:  'Outfit', system-ui, sans-serif;
+    --font-mono:  'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
+
+    --size-hero:  clamp(2.4rem, 6vw + 1rem, 4.75rem);
+    --size-h2:    clamp(1.6rem, 3vw + .5rem, 2.5rem);
+    --size-h3:    clamp(1.1rem, 1.5vw + .3rem, 1.4rem);
+    --size-body:  clamp(.94rem, .5vw + .8rem, 1.0625rem);
+    --size-small: clamp(.8rem, .2vw + .75rem, .875rem);
+    --size-mono:  clamp(.75rem, .3vw + .65rem, .8125rem);
+
+    --gap:    clamp(1.5rem, 3vw, 2.25rem);
+    --gap-lg: clamp(3rem, 5vw, 4.5rem);
+
+    --ease:        cubic-bezier(.4,0,.2,1);
+    --ease-spring: cubic-bezier(.34,1.56,.64,1);
+    --dur:    .3s;
+    --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--green);
+  }
+  [data-theme="light"] {
+    --bg:        #f8f8f8;
+    --bg-raised: #ffffff;
+    --bg-card:   #ffffff;
+    --surface:   #f0f0f2;
+    --border:    rgba(0,0,0,.08);
+    --border-hover: rgba(0,0,0,.15);
+    --text:      #1a1a1a;
+    --text-dim:  #525252;
+    --text-mute: #78716c;
+    --green:     #16a34a;
+    --green-dim: rgba(22,163,74,.1);
+    --green-glow:rgba(22,163,74,.15);
+    --purple:    #7c3aed;
+    --yellow:    #ca8a04;
+    --yellow-dim:rgba(202,138,4,.1);
+  }
+
+  /* ==========================================================
+     RESET + BASE
+     ========================================================== */
+  *, *::before, *::after { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; overflow-x: clip; }
+  body {
+    margin: 0;
+    font-family: var(--font-body);
+    font-size: var(--size-body);
+    color: var(--text);
+    background: var(--bg);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: clip;
+  }
+  body::before {
+    content: '';
+    position: fixed; inset: 0; z-index: 9999;
+    pointer-events: none; opacity: .035;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-size: 180px;
+  }
+  [data-theme="dark"] body::after {
+    content: '';
+    position: fixed; inset: 0; z-index: 0;
+    pointer-events: none; opacity: .2;
+    background-image: radial-gradient(circle, rgba(255,255,255,.08) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+  a { color: inherit; text-decoration: none; }
+  button { font: inherit; cursor: pointer; }
+  ::selection { background: var(--green-glow); color: var(--text); }
+  :focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: 4px; }
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; padding: 0;
+    margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+  }
+
+  /* Container width + padding mirror the parent xjmani.com landing page
+     so tool pages and the home page feel like one product. */
+  .container {
+    width: 100%;
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 0 clamp(1.25rem, 4vw, 2.5rem);
+  }
+  /* Fixed header height (without safe-area). Used to offset main so the
+     hero doesn't slide under the fixed nav on first paint. */
+  :root { --hdr-h: 60px; }
+
+  /* Main is offset for the fixed header. env(safe-area-inset-top) accounts
+     for the iOS notch / dynamic island so content below the bar starts at
+     the right place on every device. */
+  main {
+    position: relative;
+    z-index: 1;
+    padding-top: calc(var(--hdr-h) + env(safe-area-inset-top, 0px));
+  }
+
+  /* ==========================================================
+     HEADER — fixed + opaque, mirrors the landing page nav. The
+     background extends into the iOS safe-area (notch / dynamic
+     island) so the status bar area is never transparent.
+     ========================================================== */
+  .hdr {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+  .hdr__inner {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 1rem; padding-block: .9rem;
+  }
+  /* Breadcrumb. Each segment is independently clickable; the current
+     page reads as bold + neutral with a tool-color underline. The
+     leading SVG arrow nudges left on hover for a small "back" tell.
+     Slug font is kept mono for that "you are at /tools/<slug>" feel. */
+  .hdr__breadcrumb {
+    display: inline-flex;
+    align-items: center;
+    gap: .15rem;
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    letter-spacing: .02em;
+    min-width: 0;
+  }
+  .hdr__crumb {
+    display: inline-flex;
+    align-items: center;
+    gap: .45rem;
+    padding: .3rem .45rem;
+    margin: -.3rem -.05rem;
+    border-radius: 6px;
+    color: var(--text-dim);
+    text-decoration: none;
+    white-space: nowrap;
+    transition: color .18s var(--ease), background .18s var(--ease);
+  }
+  .hdr__crumb:hover {
+    color: var(--text);
+    background: color-mix(in srgb, var(--text) 5%, transparent);
+  }
+  .hdr__crumb--brand .hdr__name { color: var(--text); font-weight: 500; }
+  .hdr__crumb--brand .x { color: var(--green); }
+  .hdr__crumb--current {
+    color: var(--text);
+    font-weight: 500;
+    cursor: default;
+    position: relative;
+  }
+  .hdr__crumb--current:hover { background: transparent; color: var(--text); }
+  .hdr__crumb--current::after {
+    content: '';
+    position: absolute;
+    left: .45rem;
+    right: .45rem;
+    bottom: .25rem;
+    height: 1px;
+    background: linear-gradient(90deg, var(--red), transparent 100%);
+    opacity: .7;
+  }
+  .hdr__crumb-sep {
+    color: var(--text-mute);
+    user-select: none;
+    pointer-events: none;
+    opacity: .55;
+    font-weight: 300;
+  }
+  .hdr__right { display: flex; align-items: center; gap: .85rem; }
+
+  .theme-tog {
+    width: 36px; height: 36px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    border-radius: 10px;
+    color: var(--text-dim);
+    transition: all .2s var(--ease);
+  }
+  .theme-tog:hover { color: var(--text); border-color: var(--border-hover); }
+  .theme-tog svg { width: 16px; height: 16px; }
+  [data-theme="dark"] .theme-tog .moon,
+  [data-theme="light"] .theme-tog .sun { display: none; }
+
+  @media (max-width: 540px) {
+    /* Collapse the middle "tools" crumb on narrow screens; brand and
+       current-page slug stay so users still know where they are. */
+    .hdr__crumb--mid,
+    .hdr__crumb-sep--mid { display: none; }
+  }
+
+  /* ==========================================================
+     HERO
+     ========================================================== */
+  .hero {
+    padding-block: clamp(2.25rem, 5vw, 3.75rem) clamp(1.75rem, 3vw, 2.5rem);
+    position: relative; overflow: clip;
+  }
+  .hero::before {
+    content: '';
+    position: absolute; inset: 0;
+    pointer-events: none;
+    background: radial-gradient(40% 50% at 80% 10%, var(--red-dim) 0%, transparent 70%);
+    opacity: .8;
+    z-index: -1;
+  }
+  .hero__eyebrow {
+    display: inline-flex; align-items: center; gap: .5rem;
+    padding: .35rem .7rem;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    color: var(--text-dim);
+    margin-bottom: 1.25rem;
+  }
+  .hero__eyebrow::before {
+    content: ''; width: 6px; height: 6px; border-radius: 999px;
+    background: var(--red);
+    box-shadow: 0 0 0 3px var(--red-dim);
+  }
+  .hero__title {
+    font-family: var(--font-body);
+    font-weight: 600;
+    font-size: var(--size-hero);
+    line-height: .98;
+    letter-spacing: -.03em;
+    margin: 0 0 .9rem;
+    color: var(--text);
+  }
+  .hero__title .accent {
+    background: linear-gradient(90deg, var(--red), color-mix(in srgb, var(--red) 50%, var(--purple)));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .hero__sub {
+    font-size: clamp(1rem, .8vw + .8rem, 1.15rem);
+    color: var(--text-dim);
+    max-width: 60ch;
+    margin: 0 0 2rem;
+  }
+  .hero__sub strong { color: var(--text); font-weight: 600; }
+
+  /* ==========================================================
+     DROP ZONE
+     ========================================================== */
+  .drop {
+    position: relative;
+    border: 1px dashed color-mix(in srgb, var(--red) 35%, var(--border) 65%);
+    background:
+      linear-gradient(180deg, color-mix(in srgb, var(--red) 4%, transparent), transparent 60%),
+      var(--bg-card);
+    border-radius: 16px;
+    padding: clamp(2.25rem, 5vw, 3.5rem) clamp(1.5rem, 3vw, 2.25rem);
+    text-align: center;
+    transition: all .25s var(--ease);
+    overflow: hidden;
+  }
+  .drop::before {
+    content: '';
+    position: absolute; inset: 0;
+    background-image: radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--red) 40%, transparent) 1px, transparent 0);
+    background-size: 18px 18px;
+    opacity: .12;
+    pointer-events: none;
+    transition: opacity .25s var(--ease);
+  }
+  .drop[data-active="true"] {
+    border-color: var(--red);
+    background:
+      linear-gradient(180deg, color-mix(in srgb, var(--red) 10%, transparent), transparent 70%),
+      var(--bg-card);
+    transform: scale(1.005);
+  }
+  .drop[data-active="true"]::before { opacity: .35; }
+  .drop__icon {
+    width: 56px; height: 56px;
+    margin: 0 auto 1rem;
+    display: flex; align-items: center; justify-content: center;
+    border: 1px solid var(--border-hover);
+    background: var(--surface);
+    border-radius: 14px;
+    color: var(--red);
+    transition: all .25s var(--ease);
+  }
+  .drop[data-active="true"] .drop__icon {
+    border-color: var(--red);
+    background: var(--red-dim);
+    transform: translateY(-2px);
+  }
+  .drop__icon svg { width: 24px; height: 24px; }
+  .drop__title {
+    font-family: var(--font-mono);
+    font-size: var(--size-h3);
+    font-weight: 500;
+    letter-spacing: -.01em;
+    margin: 0 0 .35rem;
+    color: var(--text);
+  }
+  .drop__title .blink {
+    display: inline-block; width: .55ch;
+    background: var(--red);
+    color: transparent;
+    margin-left: 2px;
+    animation: caret 1.05s steps(1) infinite;
+  }
+  @keyframes caret { 50% { background: transparent; } }
+  .drop__sub {
+    font-size: var(--size-small);
+    color: var(--text-dim);
+    margin: 0 0 1.25rem;
+  }
+  .drop__btn {
+    display: inline-flex; align-items: center; gap: .5rem;
+    padding: .7rem 1.15rem;
+    background: var(--red);
+    color: #1c0606;
+    border: none;
+    border-radius: 10px;
+    font-family: var(--font-mono);
+    font-size: var(--size-small);
+    font-weight: 600;
+    transition: all .2s var(--ease);
+  }
+  .drop__btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 8px 24px -8px color-mix(in srgb, var(--red) 50%, transparent);
+  }
+  .drop__formats {
+    margin-top: 1.25rem;
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    color: var(--text-mute);
+    letter-spacing: .04em;
+  }
+
+  /* ==========================================================
+     PRIVACY STRIP — uses the tool's brand color (NOT brand green).
+     This callout is a product claim about the redactor specifically;
+     the green is reserved for the global privacy promise on the
+     parent landing page and the proof section below.
+     ========================================================== */
+  .privacy {
+    margin-top: 1.25rem;
+    padding: .85rem 1.1rem;
+    border: 1px solid color-mix(in srgb, var(--red) 25%, var(--border));
+    background:
+      linear-gradient(135deg, var(--red-dim), transparent 60%),
+      var(--bg-card);
+    border-radius: 12px;
+    display: flex; align-items: center; gap: .85rem;
+    font-family: var(--font-mono);
+    font-size: var(--size-small);
+    color: var(--text-dim);
+  }
+  .privacy svg { width: 18px; height: 18px; color: var(--red); flex-shrink: 0; }
+  .privacy strong { color: var(--text); font-weight: 600; }
+
+  /* ==========================================================
+     Disable browser double-tap-to-zoom on UI controls. Pinch-zoom on
+     the document remains allowed (we don't use `none` and we don't set
+     it on the page rendering area). This kills the annoying behavior
+     where rapid taps on buttons / toolbars zoom the entire app.
+     ========================================================== */
+  .hdr, .hdr *,
+  .ctrl-bar,
+  .toolbar, .toolbar *,
+  .pending-bar, .pending-bar *,
+  .dialog, .dialog *,
+  .hero, .hero *,
+  .ftr, .ftr *,
+  .mobile-hint, .mobile-hint *,
+  .result {
+    touch-action: manipulation;
+  }
+
+  /* ==========================================================
+     CONTROL BAR — toolbar + pending bar pinned together at top of
+     viewport so all redaction controls stay reachable while scrolling.
+     ========================================================== */
+  .workspace { margin-top: 1.5rem; display: none; }
+  .workspace[data-active="true"] { display: block; }
+
+  /* Stuck under the fixed header (--hdr-h + iOS safe-area) so the
+     toolbar / pending-bar pin just below the nav as you scroll. */
+  .ctrl-bar {
+    position: sticky;
+    top: calc(var(--hdr-h) + env(safe-area-inset-top, 0px));
+    z-index: 30;
+    background: var(--bg);
+    padding-block: .35rem .55rem;
+    margin-bottom: .8rem;
+    display: flex;
+    flex-direction: column;
+    gap: .5rem;
+  }
+
+  .toolbar {
+    padding: .55rem .65rem;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    border-radius: 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: .55rem;
+    align-items: center;
+  }
+  /* Three groups, each with its own purpose: view (zoom), workflow
+     (auto-detect / clear), primary (export). On desktop the primary group
+     gets pushed right via margin-left: auto. */
+  .toolbar__group {
+    display: inline-flex;
+    align-items: center;
+    gap: .35rem;
+  }
+  /* Subtle separator before the workflow group (visual break between
+     view-controls and document-action controls). */
+  .toolbar__group--workflow {
+    padding-left: .55rem;
+    border-left: 1px solid var(--border);
+    margin-left: .15rem;
+  }
+  .toolbar__group--primary {
+    margin-left: auto;
+    gap: .55rem;
+  }
+
+  /* ==========================================================
+     CUSTOM PATTERNS DIALOG
+     ========================================================== */
+  .custom-patterns-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    margin-left: .35rem;
+    padding: 0 .35rem;
+    border-radius: 999px;
+    background: var(--yellow);
+    color: #1a1100;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+  }
+  .custom-patterns-count[hidden] { display: none; }
+
+  .dialog {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    background: rgba(0, 0, 0, .55);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    animation: dialog-in .2s var(--ease);
+  }
+  .dialog[hidden] { display: none; }
+  @keyframes dialog-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+  .dialog__panel {
+    background: var(--bg-card);
+    border: 1px solid var(--btn-border);
+    border-radius: 14px;
+    padding: 1.25rem 1.4rem 1.4rem;
+    max-width: 100%;
+    width: 540px;
+    max-height: calc(100vh - 2rem);
+    overflow-y: auto;
+    box-shadow: 0 20px 48px -12px rgba(0,0,0,.7);
+  }
+  .dialog__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: .65rem;
+  }
+  .dialog__head h3 {
+    margin: 0;
+    font-family: var(--font-body);
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: var(--text);
+  }
+  .dialog__close {
+    width: 32px; height: 32px;
+    background: var(--surface);
+    border: 1px solid var(--btn-border);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .dialog__close:hover { background: color-mix(in srgb, var(--text) 8%, var(--surface)); }
+  .dialog__hint {
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    color: var(--text-dim);
+    line-height: 1.55;
+    margin: 0 0 .85rem;
+  }
+  .dialog__hint--small { font-size: 10px; margin-top: .85rem; margin-bottom: 0; }
+  .dialog__hint strong { color: var(--text); font-weight: 600; }
+  .dialog__inputrow {
+    display: flex;
+    gap: .5rem;
+    margin-bottom: .65rem;
+  }
+  .dialog__inputrow--stack {
+    flex-direction: column;
+  }
+  .dialog__inputrow input {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: var(--btn-h);
+    padding: 0 .8rem;
+    border: 1px solid var(--btn-border);
+    background: var(--surface);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    border-radius: 8px;
+  }
+  .dialog__inputrow input:focus {
+    outline: none;
+    border-color: var(--red);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--red) 25%, transparent);
+  }
+  .dialog__regex {
+    display: flex;
+    flex-direction: column;
+    gap: .35rem;
+    margin-bottom: 1rem;
+    padding: .65rem .8rem;
+    background: var(--bg-raised);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+  }
+  .dialog__regex label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: .12em;
+    color: var(--text-mute);
+  }
+  .dialog__regex input {
+    background: transparent;
+    border: 0;
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    padding: 0;
+  }
+  .dialog__regex input:focus {
+    outline: none;
+    color: var(--yellow);
+  }
+  .dialog__regex-status {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-mute);
+    min-height: 12px;
+  }
+  .dialog__regex-status[data-state="error"] { color: var(--red); }
+  .dialog__regex-status[data-state="ok"] { color: var(--green); }
+  .dialog__list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: .5rem;
+  }
+  .dialog__list:empty { display: none; }
+  .dialog__list li {
+    display: flex;
+    align-items: center;
+    gap: .65rem;
+    padding: .55rem .75rem;
+    background: var(--surface);
+    border: 1px solid var(--btn-border);
+    border-radius: 8px;
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+  }
+  .dialog__list .source {
+    color: var(--text);
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 0 0 auto;
+    max-width: 40%;
+  }
+  .dialog__list .regex {
+    color: var(--text-dim);
+    font-size: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .dialog__list .remove {
+    flex: 0 0 auto;
+    width: 28px; height: 28px;
+    border: 1px solid var(--btn-border);
+    background: var(--bg-card);
+    border-radius: 6px;
+    color: var(--text-mute);
+    cursor: pointer;
+    line-height: 1;
+  }
+  .dialog__list .remove:hover {
+    color: var(--red);
+    border-color: var(--red);
+  }
+  @media (max-width: 600px) {
+    .dialog__panel { padding: 1rem; }
+    .dialog__inputrow { flex-direction: column; }
+    .dialog__inputrow .btn { width: 100%; }
+    .dialog__list .source { max-width: 35%; }
+    .dialog__list .regex { display: none; }
+  }
+
+  .mobile-hint {
+    display: flex;
+    align-items: center;
+    gap: .65rem;
+    padding: .65rem .85rem .65rem .75rem;
+    margin-bottom: .9rem;
+    border: 1px solid color-mix(in srgb, var(--green) 30%, transparent);
+    background: color-mix(in srgb, var(--green-dim) 75%, var(--bg-card));
+    border-radius: 12px;
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    color: var(--text);
+    transition: opacity .35s var(--ease);
+  }
+  .mobile-hint svg { width: 18px; height: 18px; color: var(--green); flex-shrink: 0; }
+  .mobile-hint strong { color: var(--green); font-weight: 700; }
+  .mobile-hint__close {
+    appearance: none;
+    background: transparent;
+    border: 0;
+    color: var(--text-dim);
+    font-size: 18px;
+    line-height: 1;
+    padding: 0 .15rem;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .mobile-hint__close:hover { color: var(--text); }
+  .tool-group {
+    display: inline-flex; gap: 2px;
+    background: var(--surface);
+    border: 1px solid var(--btn-border);
+    border-radius: 8px;
+    padding: 3px;
+    height: var(--btn-h);
+    box-sizing: border-box;
+    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
+                0 1px 2px rgba(0,0,0,.35);
+  }
+  .tool-btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: .4rem;
+    padding: 0 .8rem;
+    border: 0;
+    background: transparent;
+    border-radius: 6px;
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    color: var(--text);
+    transition: background .15s var(--ease);
+    letter-spacing: .03em;
+  }
+  .tool-btn:hover { background: color-mix(in srgb, var(--text) 8%, transparent); }
+  .tool-btn[aria-pressed="true"] {
+    background: var(--red-dim);
+    color: var(--red);
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--red) 35%, transparent) inset,
+      0 0 16px -4px color-mix(in srgb, var(--red) 50%, transparent);
+    font-weight: 600;
+  }
+  .tool-btn svg { width: 14px; height: 14px; }
+
+  .toolbar__file {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex; align-items: center; gap: .55rem;
+    padding-inline: .35rem;
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    color: var(--text-dim);
+    overflow: hidden;
+  }
+  .toolbar__file .name {
+    color: var(--text);
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .toolbar__file .pages { color: var(--text-mute); }
+  .toolbar__count {
+    display: inline-flex; align-items: center; gap: .35rem;
+    padding: .35rem .65rem;
+    border-radius: 999px;
+    background: var(--red-dim);
+    color: var(--red);
+    border: 1px solid color-mix(in srgb, var(--red) 30%, transparent);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    line-height: 1;
+  }
+  .toolbar__count[hidden] { display: none; }
+
+  /* Button border + height tokens — strong enough to meet WCAG 1.4.11
+     non-text contrast (~3:1) against both bg-card and the pending-bar
+     yellow-tinted background. */
+  :root { --btn-border: rgba(255,255,255,.24); --btn-h: 38px; }
+  [data-theme="light"] { --btn-border: rgba(0,0,0,.22); }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    gap: .5rem;
+    height: var(--btn-h);
+    padding: 0 .9rem;
+    border-radius: 8px;
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    font-weight: 500;
+    border: 1px solid var(--btn-border);
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
+                0 1px 2px rgba(0,0,0,.35);
+    transition: background .15s var(--ease), border-color .15s var(--ease);
+  }
+  .btn:hover {
+    border-color: color-mix(in srgb, var(--text) 38%, transparent);
+    background: color-mix(in srgb, var(--text) 7%, var(--surface));
+  }
+  .btn:disabled,
+  .pending-bar__btn:disabled {
+    opacity: .55;
+    cursor: not-allowed;
+    background: var(--bg-card);
+    border-color: var(--border);
+    color: var(--text-mute);
+    box-shadow: none;
+  }
+  .btn:disabled:hover,
+  .pending-bar__btn:disabled:hover {
+    background: var(--bg-card);
+    border-color: var(--border);
+  }
+  .btn svg { width: 14px; height: 14px; }
+  .btn--red {
+    background: var(--red);
+    color: #1c0606;
+    border-color: var(--red);
+    font-weight: 600;
+    box-shadow: 0 1px 2px rgba(0,0,0,.35),
+                inset 0 1px 0 rgba(255,255,255,.25);
+  }
+  .btn--red:hover {
+    background: color-mix(in srgb, white 8%, var(--red));
+    border-color: color-mix(in srgb, white 8%, var(--red));
+    box-shadow: 0 8px 24px -8px color-mix(in srgb, var(--red) 60%, transparent),
+                inset 0 1px 0 rgba(255,255,255,.3);
+  }
+  .btn--ghost { background: transparent; border-color: var(--btn-border); }
+  .btn--ghost:hover { background: var(--surface); }
+
+  /* Recessed control rail used by both the cursor-mode segmented
+     control (Mark / Select) and the zoom group (- 100% +). Both share
+     the same visual rail so the toolbar reads as a coherent set of
+     control families rather than mismatched stragglers. */
+  .toolbar__group--mode,
+  .toolbar__group--view {
+    height: var(--btn-h);
+    padding: 3px;
+    gap: 2px;
+    background: color-mix(in srgb, var(--text) 4%, transparent);
+    border: 1px solid var(--btn-border);
+    border-radius: 10px;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,.28);
+  }
+
+  /* Cursor mode buttons sit inside the rail as borderless tabs; the
+     active one rises with a subtle border and shadow (iOS-style). */
+  .toolbar__group--mode .btn--mode {
+    height: 100%;
+    padding: 0 .75rem;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    color: var(--text-dim);
+    box-shadow: none;
+    font-weight: 500;
+    transition:
+      background .18s var(--ease),
+      color .18s var(--ease),
+      border-color .18s var(--ease),
+      box-shadow .18s var(--ease);
+  }
+  .toolbar__group--mode .btn--mode svg {
+    width: 14px; height: 14px;
+    opacity: .8;
+    transition: opacity .18s var(--ease);
+  }
+  .toolbar__group--mode .btn--mode[aria-pressed="true"] {
+    background: var(--bg-card);
+    color: var(--text);
+    border-color: color-mix(in srgb, var(--text) 22%, transparent);
+    box-shadow: 0 1px 2px rgba(0,0,0,.35),
+                inset 0 1px 0 color-mix(in srgb, white 6%, transparent);
+  }
+  .toolbar__group--mode .btn--mode[aria-pressed="true"] svg { opacity: 1; }
+  .toolbar__group--mode .btn--mode[aria-pressed="false"]:hover {
+    color: var(--text);
+    background: color-mix(in srgb, var(--text) 5%, transparent);
+  }
+
+  /* Zoom buttons in the rail: borderless, dim until hover, fade when
+     disabled. No "active" state — these are momentary actions. */
+  .toolbar__group--view .tool-btn {
+    height: 100%;
+    padding: 0 .65rem;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--text-dim);
+    transition: background .18s var(--ease), color .18s var(--ease);
+  }
+  .toolbar__group--view .tool-btn:hover {
+    background: color-mix(in srgb, var(--text) 5%, transparent);
+    color: var(--text);
+  }
+  .toolbar__group--view .tool-btn:disabled {
+    opacity: .55;
+    cursor: not-allowed;
+  }
+  .toolbar__group--view .tool-btn:disabled:hover {
+    background: transparent;
+    color: var(--text-dim);
+  }
+  /* Lock the level button (and its inner text span) to a fixed width
+     so the rail doesn't twitch as the value flips between 2- and
+     3-digit percentages (e.g. 75% ↔ 100%, 100% ↔ 150%). Width covers
+     the widest case ("300%") plus breathing room. The +/- icon
+     buttons are already fixed by their square icon content. */
+  #zoomLevelBtn { min-width: 58px; padding-inline: .35rem; }
+  #zoomLevel    { display: inline-block; width: 100%; text-align: center; }
+
+  /* ==========================================================
+     RESULT BANNER
+     ========================================================== */
+  .result {
+    display: none;
+    align-items: flex-start;
+    gap: .65rem;
+    margin-bottom: 1rem;
+    padding: .75rem 1rem;
+    border-radius: 12px;
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    line-height: 1.55;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    color: var(--text-dim);
+    opacity: 0;
+    transition: opacity .35s var(--ease);
+    animation: result-in .35s var(--ease) both;
+  }
+  @keyframes result-in {
+    from { transform: translateY(-6px); opacity: 0; }
+    to   { transform: translateY(0);    opacity: 1; }
+  }
+  .result[data-kind="ok"] {
+    border-color: color-mix(in srgb, var(--green) 30%, transparent);
+    background: linear-gradient(135deg, var(--green-dim), transparent 60%), var(--bg-card);
+    color: var(--text);
+  }
+  .result[data-kind="warn"] {
+    border-color: color-mix(in srgb, var(--yellow) 35%, transparent);
+    background: linear-gradient(135deg, var(--yellow-dim), transparent 60%), var(--bg-card);
+    color: var(--text);
+  }
+  .result[data-kind="err"] {
+    border-color: color-mix(in srgb, var(--red) 35%, transparent);
+    background: linear-gradient(135deg, var(--red-dim), transparent 60%), var(--bg-card);
+    color: var(--text);
+  }
+
+  /* ==========================================================
+     MOBILE-FIRST: tighten toolbar/buttons/hero/drop on narrow widths
+     ========================================================== */
+  @media (max-width: 600px) {
+    .container { padding-inline: 1rem; }
+    .hero { padding-block: 1.5rem 1.25rem; }
+    .hero__sub { margin-bottom: 1.25rem; }
+    .drop { padding: 2rem 1rem; }
+    .drop__icon { width: 44px; height: 44px; }
+    .drop__icon svg { width: 20px; height: 20px; }
+    .privacy { font-size: 11px; padding: .65rem .8rem; }
+    .privacy svg { width: 16px; height: 16px; }
+    .toolbar {
+      padding: .55rem;
+      gap: .4rem;
+      /* Row+wrap so groups can share rows: Row 1 = mode + zoom,
+         Row 2 = workflow, Row 3 = export. */
+      flex-direction: row;
+      flex-wrap: wrap;
+      align-items: stretch;
+    }
+    .toolbar__group {
+      display: flex;
+      gap: .35rem;
+    }
+    /* Bigger touch targets on mobile (44px). */
+    :root { --btn-h: 44px; }
+
+    /* Row 1: mode rail grows to fill space, zoom rail stays compact
+       on the right. Both keep their recessed rail look (2px internal
+       gap, overriding the .35rem default for non-rail groups). */
+    .toolbar__group--mode,
+    .toolbar__group--view {
+      gap: 2px;
+    }
+    .toolbar__group--mode {
+      flex: 1 1 0;
+      min-width: 0;
+    }
+    .toolbar__group--mode > .btn {
+      flex: 1 1 0;
+      min-width: 0;
+    }
+    .toolbar__group--view {
+      flex: 0 0 auto;
+    }
+    /* Compact zoom buttons so the trio fits next to mode without
+       crowding. The "100%" text auto-hides at <=380px (rule below). */
+    .toolbar__group--view .tool-btn {
+      padding: 0 .55rem;
+      font-size: 12px;
+    }
+    .toolbar__group--view .tool-btn svg { width: 14px; height: 14px; }
+
+    /* Row 2: workflow group spans the full row, buttons split evenly. */
+    .toolbar__group--workflow {
+      flex: 0 0 100%;
+      padding-left: 0;
+      border-left: 0;
+      margin-left: 0;
+    }
+    .toolbar__group--workflow > .btn {
+      flex: 1 1 0;
+    }
+
+    /* Row 3: export spans the full row. */
+    .toolbar__group--primary {
+      flex: 0 0 100%;
+      margin-left: 0;
+    }
+    .toolbar__group--primary > .btn {
+      flex: 1 1 auto;
+    }
+    /* Hide the small "X redactions" caption on mobile — chips already
+       imply count, and the export button width says enough. */
+    .toolbar__count { display: none; }
+
+    .pending-bar {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 1.15rem;
+      padding: 1.1rem 1rem 1.1rem;
+    }
+    /* Extra breathing room around the chip pills so they don't crowd the
+       title above or the action buttons below. */
+    .kind-chips {
+      margin-block: .15rem;
+      gap: .5rem;
+    }
+    /* On mobile the right-side divider doesn't help — replace it with a
+       full-width bottom rule so the title clearly sits above the chip list
+       as a section header rather than a stranded label. */
+    .pending-bar__title {
+      align-self: stretch;
+      width: 100%;
+      padding-right: 0;
+      border-right: 0;
+      padding-top: .35rem;
+      padding-bottom: 1rem;
+      margin-bottom: .25rem;
+      border-bottom: 1px solid color-mix(in srgb, var(--yellow) 30%, transparent);
+      height: auto;
+      gap: .55rem;
+    }
+    /* Title size/weight overrides for mobile live in the second
+       max-width: 600px block below (after the desktop title rule), so
+       the cascade order lets them win. */
+    /* Chips left-aligned, may wrap to multiple rows. */
+    .kind-chips {
+      width: 100%;
+      justify-content: flex-start;
+    }
+    /* Actions: flex with equal-grow buttons. More reliable than grid for
+       this combo of variable button widths + nowrap text + min-width: 0. */
+    .pending-bar__actions {
+      margin-left: 0;
+      display: flex;
+      width: 100%;
+      gap: .4rem;
+    }
+    .pending-bar__btn {
+      flex: 1 1 0;
+      min-width: 0;
+      width: auto;
+      white-space: nowrap;
+    }
+    .toolbar__file { display: none; }
+    .toolbar__count { padding: .25rem .5rem; font-size: 10px; }
+    .btn { padding: .45rem .65rem; font-size: 11px; gap: .35rem; }
+    .btn svg { width: 12px; height: 12px; }
+    /* Hide secondary words ("redacted", "detect") on small screens */
+    .btn .btn__short { display: none; }
+    .pending-bar { padding: .45rem .55rem; font-size: 11px; gap: .35rem; }
+    .pending-bar__btn { padding: .35rem .55rem; font-size: 11px; }
+    .kind-chip { padding: .25rem .5rem; font-size: 10px; }
+    .kind-chip::before { width: 8px; height: 8px; }
+    .page__label { font-size: 10px; top: -1.1rem; }
+    .pages { gap: 1rem; padding-bottom: 2rem; }
+  }
+  @media (max-width: 380px) {
+    /* Even tighter: collapse toolbar to icons-mostly */
+    .tool-btn span,
+    .btn .btn__abbr-hide { display: none; }
+  }
+
+  /* ==========================================================
+     PAGES VIEWPORT
+     ========================================================== */
+  .pages {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+    padding-bottom: 4rem;
+  }
+  /* Wraps each .page; allows horizontal scroll when the page is wider than
+     the viewport (typically after zooming in). Each page scrolls
+     independently so vertical scrolling between pages still works.
+     NOTE: must NOT be a flex container — flex centering with overflow makes
+     the left side of an overflowed item unreachable (scroll origin sits at
+     the visible left edge, but flex pushes content past it on both sides).
+     Using block layout + margin:0 auto keeps centering when smaller and
+     left-aligns when wider, so scroll works in both directions. */
+  .page-frame {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    max-width: 100%;
+  }
+  .page-frame::-webkit-scrollbar { height: 6px; }
+  .page-frame::-webkit-scrollbar-thumb {
+    background: var(--border-hover);
+    border-radius: 3px;
+  }
+  .page {
+    position: relative;
+    margin: 0 auto;
+    background: #ffffff;
+    box-shadow:
+      0 1px 0 rgba(0,0,0,.4),
+      0 12px 32px -12px rgba(0,0,0,.55);
+    border-radius: 4px;
+    overflow: hidden;
+    /* width set inline based on rendered canvas */
+  }
+  .page__canvas { display: block; }
+  .page__overlay {
+    position: absolute; inset: 0;
+    cursor: crosshair;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    /* Allow native pan/pinch by default. Touch-drawing is initiated by a
+       double-tap (see wireOverlay) which then captures the pointer and
+       suppresses scroll for that gesture. */
+    touch-action: manipulation;
+  }
+  /* Transparent text layer used for copy/paste in "Select" cursor mode.
+     Each span is positioned over its rendered glyph so the user can drag
+     to highlight; characters are color: transparent so they don't double
+     up visually with the canvas-rendered text. */
+  .page__textLayer {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    line-height: 1;
+    pointer-events: none;
+    user-select: none;
+  }
+  .page__textLayer span {
+    position: absolute;
+    color: transparent;
+    white-space: pre;
+    transform-origin: 0 0;
+    cursor: text;
+    line-height: 1;
+    font-family: sans-serif;
+    /* Force kerning + tabular numbers so digit-heavy items render with
+       predictable advance widths. This won't fix all per-item drift but
+       reduces variation in numeric strings (account/order IDs etc.). */
+    font-kerning: normal;
+    font-feature-settings: "kern" 1;
+    font-variant-numeric: tabular-nums;
+  }
+  /* In Select mode the overlay steps aside (so clicks reach the text
+     layer) and the text layer becomes selectable. Existing rect elements
+     keep pointer-events so dismissing redactions still works. */
+  .workspace[data-mode="select"] .page__overlay {
+    pointer-events: none;
+    cursor: default;
+  }
+  .workspace[data-mode="select"] .page__overlay .rect {
+    pointer-events: auto;
+  }
+  .workspace[data-mode="select"] .page__textLayer {
+    pointer-events: auto;
+    user-select: text;
+    -webkit-user-select: text;
+  }
+  /* Visible green highlight, but `color: transparent` on the selection
+     itself prevents the (otherwise transparent) text-layer characters
+     from rendering when the browser would auto-recolor selected text.
+     Result: a clean colored band, with the canvas-rendered text below
+     showing through unchanged — no ghost duplicate of the glyphs. */
+  .workspace[data-mode="select"] .page__textLayer ::selection {
+    background: color-mix(in srgb, var(--green) 35%, transparent);
+    color: transparent;
+  }
+  .workspace[data-mode="select"] .page__textLayer ::-moz-selection {
+    background: color-mix(in srgb, var(--green) 35%, transparent);
+    color: transparent;
+  }
+  .page__label {
+    position: absolute;
+    top: -1.4rem; left: 0;
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    color: var(--text-mute);
+    letter-spacing: .06em;
+    text-transform: uppercase;
+  }
+  .rect {
+    position: absolute;
+    background: rgba(0,0,0,.92);
+    border: 1px solid #000;
+    box-shadow: 0 0 0 1px rgba(248,113,113,.7);
+    cursor: pointer;
+    transition: box-shadow .15s var(--ease);
+  }
+  .rect:hover {
+    box-shadow: 0 0 0 1px var(--red), 0 0 0 4px var(--red-dim);
+  }
+  .rect[data-pending="true"] {
+    background: rgba(255,202,0,.22);
+    border: 1px dashed var(--yellow);
+    box-shadow: 0 0 0 1px rgba(255,202,0,.35);
+    cursor: pointer;
+  }
+  .rect[data-pending="true"]:hover {
+    background: rgba(255,202,0,.34);
+    box-shadow: 0 0 0 1px var(--yellow), 0 0 0 4px var(--yellow-dim);
+  }
+  .rect[data-pending="true"] .rect__kind {
+    position: absolute;
+    top: -1.1rem; left: 0;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--yellow);
+    color: #1a1100;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    line-height: 1.4;
+    white-space: nowrap;
+    pointer-events: none;
+  }
+  .rect__del {
+    position: absolute;
+    top: -10px; right: -10px;
+    width: 22px; height: 22px;
+    border-radius: 999px;
+    background: var(--red);
+    color: #1c0606;
+    border: 2px solid var(--bg);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    display: none;
+    align-items: center; justify-content: center;
+    line-height: 1;
+  }
+  .rect:hover .rect__del { display: flex; }
+
+  .draft-rect {
+    position: absolute;
+    background: rgba(248,113,113,.18);
+    border: 1px dashed var(--red);
+    pointer-events: none;
+  }
+
+  /* ==========================================================
+     EMPTY STATE / SPINNER
+     ========================================================== */
+  .spinner {
+    width: 32px; height: 32px;
+    border: 2px solid var(--border);
+    border-top-color: var(--red);
+    border-radius: 999px;
+    animation: spin 1s linear infinite;
+    margin: 4rem auto;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ==========================================================
+     FOOTER — slim status-bar that mirrors the header. Same
+     padding-block (.9rem) so the page is symmetrically framed,
+     and a tinted background/animated green dot rhyme with the
+     offline pill in the top bar.
+     ========================================================== */
+  .ftr {
+    margin-top: var(--gap-lg);
+    background: color-mix(in srgb, var(--text) 3%, var(--bg));
+    border-top: 1px solid var(--border);
+    padding-block: .9rem;
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    letter-spacing: .02em;
+    color: var(--text-mute);
+  }
+  .ftr__inner {
+    display: flex;
+    align-items: center;
+    gap: .55rem .8rem;
+    flex-wrap: wrap;
+    line-height: 1.4;
+  }
+  .ftr__live {
+    width: 7px; height: 7px;
+    border-radius: 999px;
+    background: var(--green);
+    box-shadow: 0 0 0 0 var(--green-glow);
+    animation: ftr-pulse 2.4s var(--ease) infinite;
+    display: inline-block;
+    flex-shrink: 0;
+  }
+  @keyframes ftr-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 var(--green-glow); }
+    50%      { box-shadow: 0 0 0 5px transparent; }
+  }
+  .ftr__brand-mini {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .ftr__brand-mini .x { color: var(--green); }
+  .ftr__sep {
+    color: var(--text-mute);
+    user-select: none;
+  }
+  .ftr__inner a {
+    color: var(--text-dim);
+    transition: color .2s var(--ease);
+    display: inline-flex;
+    align-items: center;
+    gap: .25rem;
+    text-decoration: none;
+  }
+  .ftr__inner a[data-ext]::after {
+    content: '↗';
+    font-size: 10px;
+    color: var(--text-mute);
+    transition: transform .2s var(--ease), color .2s var(--ease);
+  }
+  .ftr__inner a:hover { color: var(--text); }
+  .ftr__inner a[data-ext]:hover::after { color: var(--green); transform: translate(1px, -1px); }
+  .ftr__spacer { margin-left: auto; }
+  @media (max-width: 720px) {
+    .ftr__spacer { margin-left: 0; flex-basis: 100%; height: 0; }
+  }
+
+  /* ==========================================================
+     PENDING BAR (auto-detect proposals)
+     ========================================================== */
+  /* Sits inside the sticky .ctrl-bar; pinned to top alongside the toolbar. */
+  .pending-bar {
+    padding: .55rem .7rem;
+    border: 1px solid color-mix(in srgb, var(--yellow) 40%, transparent);
+    background: color-mix(in srgb, var(--yellow-dim) 85%, var(--bg-card));
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: .55rem .85rem;
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    color: var(--text);
+  }
+  .pending-bar[hidden] { display: none; }
+
+  /* Title is a small section header — same vertical rhythm as the chips
+     beside it, with a subtle yellow divider after it on desktop so the
+     "Proposed" group is clearly demarcated from the chip list. */
+  .pending-bar__title {
+    display: inline-flex;
+    align-items: center;
+    gap: .35rem;
+    flex-shrink: 0;
+    padding-right: .65rem;
+    border-right: 1px solid color-mix(in srgb, var(--yellow) 35%, transparent);
+    height: 24px;
+  }
+  /* Desktop sizing — clearly bigger than the 11px chip text so it reads
+     as a real section title. */
+  .pending-bar__title-num {
+    color: var(--yellow);
+    font-weight: 800;
+    font-size: 20px;
+    letter-spacing: -.01em;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+  .pending-bar__title-label {
+    color: var(--text);
+    font-size: 13px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    font-weight: 700;
+    line-height: 1;
+  }
+  @media (max-width: 600px) {
+    /* Placed after the desktop title rules above so the cascade order
+       lets these mobile overrides win at <=600px. */
+    .pending-bar__title {
+      padding-right: 0;
+      border-right: 0;
+      height: auto;
+      gap: .65rem;
+    }
+    /* Mobile bumps the desktop title up just a notch — same uppercase mono
+       treatment, bigger sizes for finger-sized hierarchy. */
+    .pending-bar__title-num {
+      font-size: 24px;
+      font-weight: 800;
+      color: var(--yellow);
+      line-height: 1;
+      letter-spacing: -.01em;
+    }
+    .pending-bar__title-label {
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--text);
+      line-height: 1;
+    }
+  }
+
+  .pending-bar__actions {
+    display: inline-flex;
+    align-items: center;
+    gap: .35rem;
+    margin-left: auto;
+    flex-shrink: 0;
+  }
+  .pending-bar__count {
+    background: var(--yellow);
+    color: #1a1100;
+    padding: .25rem .6rem;
+    border-radius: 999px;
+    font-weight: 700;
+    letter-spacing: .03em;
+    white-space: nowrap;
+    font-size: 11px;
+    line-height: 1.4;
+    flex-shrink: 0;
+  }
+  /* Identical metrics to .btn so the dismiss/accept pair sit on the same
+     baseline as toolbar buttons. */
+  .pending-bar__btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: .4rem;
+    height: var(--btn-h);
+    padding: 0 .9rem;
+    border: 1px solid var(--btn-border);
+    background: var(--surface);
+    border-radius: 8px;
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    font-weight: 500;
+    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
+                0 1px 2px rgba(0,0,0,.35);
+    transition: background .15s var(--ease), border-color .15s var(--ease);
+  }
+  .pending-bar__btn:hover {
+    border-color: color-mix(in srgb, var(--text) 38%, transparent);
+    background: color-mix(in srgb, var(--text) 7%, var(--surface));
+  }
+  .pending-bar__btn--accept {
+    background: var(--yellow);
+    color: #1a1100;
+    border-color: var(--yellow);
+    font-weight: 600;
+    box-shadow: 0 1px 2px rgba(0,0,0,.35),
+                inset 0 1px 0 rgba(255,255,255,.3);
+  }
+  .pending-bar__btn--accept:hover {
+    background: color-mix(in srgb, white 8%, var(--yellow));
+    border-color: color-mix(in srgb, white 8%, var(--yellow));
+    box-shadow: 0 8px 24px -8px color-mix(in srgb, var(--yellow) 60%, transparent),
+                inset 0 1px 0 rgba(255,255,255,.35);
+  }
+
+  .kind-chips {
+    flex: 1 1 auto;
+    display: flex;
+    align-items: center;
+    gap: .35rem;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .kind-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: .4rem;
+    padding: .3rem .6rem .3rem .55rem;
+    border: 1px solid color-mix(in srgb, var(--yellow) 35%, transparent);
+    background: color-mix(in srgb, var(--yellow) 14%, var(--bg-card));
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    color: var(--text);
+    cursor: pointer;
+    user-select: none;
+    transition: all .15s var(--ease);
+    line-height: 1;
+  }
+  .kind-chip::before {
+    content: '';
+    width: 10px; height: 10px;
+    border-radius: 3px;
+    background: var(--yellow);
+    box-shadow: inset 0 0 0 2px var(--bg-card), 0 0 0 1px color-mix(in srgb, var(--yellow) 60%, transparent);
+    transition: all .15s var(--ease);
+  }
+  .kind-chip:hover {
+    border-color: var(--yellow);
+    transform: translateY(-1px);
+  }
+  .kind-chip__name { text-transform: uppercase; }
+  .kind-chip__num {
+    background: rgba(0,0,0,.32);
+    padding: 1px 6px;
+    border-radius: 999px;
+    color: var(--white);
+    font-weight: 700;
+  }
+  [data-theme="light"] .kind-chip__num { background: rgba(0,0,0,.6); color: var(--bg); }
+  .kind-chip[data-on="false"] {
+    background: var(--surface);
+    border-color: var(--border);
+    color: var(--text-mute);
+    text-decoration: line-through;
+    text-decoration-thickness: 1px;
+  }
+  .kind-chip[data-on="false"]::before {
+    background: transparent;
+    box-shadow: inset 0 0 0 1px var(--border-hover);
+  }
+  .kind-chip[data-on="false"] .kind-chip__num {
+    background: rgba(0,0,0,.18);
+    color: var(--text-mute);
+  }
+
+  /* ==========================================================
+     SECTION SHELL — used by the Proof + Take-it-home blocks
+     below the workspace. Same vertical rhythm as the hero.
+     ========================================================== */
+  section.section {
+    padding-block: var(--gap-lg);
+    position: relative;
+    overflow: clip;
+  }
+  .section__head { margin-bottom: var(--gap); max-width: 60ch; }
+  .section__eyebrow {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    color: var(--green);
+    letter-spacing: .15em;
+    text-transform: uppercase;
+    margin-bottom: .7rem;
+  }
+  .section__title {
+    font-family: var(--font-body);
+    font-size: var(--size-h2);
+    font-weight: 600;
+    line-height: 1.05;
+    letter-spacing: -.02em;
+    margin: 0 0 .8rem;
+    color: var(--text);
+  }
+  .section__lede {
+    font-size: clamp(1rem, 1vw + .8rem, 1.12rem);
+    color: var(--text-dim);
+    line-height: 1.55;
+    margin: 0;
+  }
+
+  /* ==========================================================
+     PROOF — privacy claims with verification hooks. Green accent
+     mirrors the privacy shield in the hero.
+     ========================================================== */
+  .proof {
+    display: grid;
+    gap: 1rem;
+    grid-template-columns: 1fr;
+  }
+  @media (min-width: 720px) { .proof { grid-template-columns: repeat(3, 1fr); } }
+  .proof__item {
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    border-radius: 14px;
+    padding: 1.5rem 1.4rem;
+    display: flex;
+    flex-direction: column;
+    gap: .8rem;
+    transition: border-color .25s var(--ease), transform .25s var(--ease);
+  }
+  .proof__item:hover {
+    border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+    transform: translateY(-2px);
+  }
+  .proof__num {
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    color: var(--green);
+    letter-spacing: .15em;
+  }
+  .proof__title {
+    font-family: var(--font-body);
+    font-size: var(--size-h3);
+    font-weight: 600;
+    margin: 0;
+    color: var(--text);
+  }
+  .proof__body {
+    color: var(--text-dim);
+    margin: 0;
+    font-size: var(--size-small);
+    line-height: 1.65;
+  }
+  .proof__verify {
+    margin-top: auto;
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    color: var(--green);
+    display: inline-flex;
+    align-items: center;
+    gap: .35rem;
+    cursor: pointer;
+    border: 0;
+    background: transparent;
+    padding: 0;
+    text-align: left;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    text-decoration-color: color-mix(in srgb, var(--green) 35%, transparent);
+  }
+  .proof__verify:hover { text-decoration-color: var(--green); }
+
+  /* ==========================================================
+     TAKE-IT-HOME — red accent (PDF redactor brand). Three cards:
+     standalone download, self-host, source.
+     ========================================================== */
+  .home { position: relative; }
+  .home::before {
+    content: '';
+    position: absolute;
+    top: 8%; right: -8%;
+    width: 38%; aspect-ratio: 1;
+    background: radial-gradient(circle, var(--red-dim), transparent 70%);
+    filter: blur(40px);
+    opacity: .55;
+    pointer-events: none;
+    z-index: -1;
+  }
+  .home .section__eyebrow { color: var(--red); }
+  .home__grid {
+    display: grid;
+    gap: 1rem;
+    grid-template-columns: 1fr;
+  }
+  @media (min-width: 720px) { .home__grid { grid-template-columns: repeat(3, 1fr); } }
+  .home__card {
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    border-radius: 14px;
+    padding: 1.5rem 1.4rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    transition: border-color .25s var(--ease), transform .25s var(--ease);
+    position: relative;
+    overflow: hidden;
+  }
+  .home__card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(135deg, var(--red-dim), transparent 55%);
+    opacity: 0;
+    transition: opacity .25s var(--ease);
+    pointer-events: none;
+  }
+  .home__card:hover {
+    border-color: color-mix(in srgb, var(--red) 35%, var(--border));
+    transform: translateY(-2px);
+  }
+  .home__card:hover::before { opacity: 1; }
+  .home__card > * { position: relative; }
+  .home__top {
+    display: flex; align-items: center; gap: .75rem;
+  }
+  .home__icon {
+    width: 36px; height: 36px;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--red-dim);
+    color: var(--red);
+    border-radius: 10px;
+  }
+  .home__icon svg { width: 16px; height: 16px; }
+  .home__label {
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    color: var(--text-dim);
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+  .home__title {
+    font-family: var(--font-body);
+    font-size: var(--size-h3);
+    font-weight: 600;
+    margin: 0;
+    color: var(--text);
+  }
+  .home__desc {
+    color: var(--text-dim);
+    font-size: var(--size-small);
+    line-height: 1.6;
+    margin: 0;
+    flex-grow: 1;
+  }
+  .home__cta {
+    display: inline-flex;
+    align-items: center;
+    gap: .5rem;
+    color: var(--red);
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    text-decoration: none;
+    transition: gap .2s var(--ease);
+  }
+  .home__cta:hover { gap: .75rem; }
+  .home__card:hover .home__cta { gap: .75rem; }
+
+  /* ==========================================================
+     TOAST — small floating tip used by the proof verify buttons
+     ========================================================== */
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: 1.5rem;
+    transform: translate(-50%, 1rem);
+    display: flex;
+    align-items: center;
+    gap: .65rem;
+    padding: .75rem 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 12px 32px -8px rgba(0,0,0,.55);
+    font-family: var(--font-mono);
+    font-size: var(--size-mono);
+    color: var(--text);
+    line-height: 1.5;
+    max-width: min(92vw, 540px);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .25s var(--ease), transform .25s var(--ease);
+    z-index: 200;
+  }
+  .toast.is-visible {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+  .toast__dot {
+    width: 8px; height: 8px; border-radius: 999px;
+    background: var(--green);
+    box-shadow: 0 0 0 3px var(--green-dim);
+    flex-shrink: 0;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: .01ms !important;
+      transition-duration: .01ms !important;
+    }
+  }
+</style>
+</head>
+<body>
+
+<header class="hdr">
+  <div class="container hdr__inner">
+    <nav class="hdr__breadcrumb" aria-label="Breadcrumb">
+      <a class="hdr__crumb hdr__crumb--brand" href="https://xjmani.com" aria-label="Back to xjmani.com">
+        <span class="hdr__name"><span class="x">x</span>jmani</span>
+      </a>
+      <span class="hdr__crumb-sep hdr__crumb-sep--mid" aria-hidden="true">/</span>
+      <a class="hdr__crumb hdr__crumb--mid" href="https://xjmani.com/tools">tools</a>
+      <span class="hdr__crumb-sep" aria-hidden="true">/</span>
+      <span class="hdr__crumb hdr__crumb--current" aria-current="page">pdf-redactor</span>
+    </nav>
+    <div class="hdr__right">
+      <button class="theme-tog" type="button" aria-label="Toggle theme" id="themeBtn">
+        <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="4"/>
+          <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+        </svg>
+        <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="container">
+      <span class="hero__eyebrow">Permanent redaction. Not a black rectangle.</span>
+      <h1 class="hero__title">
+        Redact PDFs without<br>
+        <span class="accent">losing the rest.</span>
+      </h1>
+      <p class="hero__sub">
+        Most online redactors slap a black box on top of the text. The text is still in the file, ready to be copy-pasted out. We <strong>actually remove the targeted content from the PDF</strong>, then paint the box on for visual confirmation. Everything outside the redaction stays as native, selectable text. Nothing is uploaded.
+      </p>
+
+      <div class="drop" id="drop" data-active="false" tabindex="0" role="button" aria-label="Drop a PDF here or click to browse">
+        <input type="file" id="fileInput" accept="application/pdf,.pdf" hidden>
+        <div class="drop__icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="9" y1="14" x2="15" y2="14"/>
+            <line x1="9" y1="18" x2="13" y2="18"/>
+          </svg>
+        </div>
+        <h2 class="drop__title">Drop a PDF here<span class="blink">_</span></h2>
+        <p class="drop__sub">or click below. Stays on this device, period.</p>
+        <button class="drop__btn" type="button" id="pickBtn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          Choose PDF
+        </button>
+        <p class="drop__formats">PDF · multi-page · up to 200 MB in browser memory</p>
+      </div>
+
+      <div class="privacy">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+        </svg>
+        <span><strong>Zero uploads.</strong> The file is opened, parsed, and redacted entirely in your browser. Open devtools and watch the network tab; you'll see nothing leave.</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="workspace" id="workspace">
+    <div class="container">
+
+      <div class="ctrl-bar">
+        <div class="toolbar" role="toolbar" aria-label="Redaction tools">
+
+          <div class="toolbar__group toolbar__group--mode" role="group" aria-label="Cursor mode">
+            <button class="btn btn--mode" type="button" data-mode="redact" aria-pressed="true" id="modeRedactBtn" title="Drag to draw redaction rectangles">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M5 3a2 2 0 0 0-2 2"/>
+                <path d="M19 3a2 2 0 0 1 2 2"/>
+                <path d="M21 19a2 2 0 0 1-2 2"/>
+                <path d="M5 21a2 2 0 0 1-2-2"/>
+                <path d="M9 3h1"/>
+                <path d="M14 3h1"/>
+                <path d="M9 21h1"/>
+                <path d="M14 21h1"/>
+                <path d="M3 9v1"/>
+                <path d="M3 14v1"/>
+                <path d="M21 9v1"/>
+                <path d="M21 14v1"/>
+              </svg>
+              Mark
+            </button>
+            <button class="btn btn--mode" type="button" data-mode="select" aria-pressed="false" id="modeSelectBtn" title="Select text to copy">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51z"/>
+                <path d="M13 13l6 6"/>
+              </svg>
+              Select
+            </button>
+          </div>
+
+          <div class="toolbar__group toolbar__group--view" role="group" aria-label="Zoom">
+            <button class="tool-btn" type="button" id="zoomOutBtn" aria-label="Zoom out" disabled>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <line x1="6" y1="12" x2="18" y2="12"/>
+              </svg>
+            </button>
+            <button class="tool-btn" type="button" id="zoomLevelBtn" aria-label="Reset zoom to 100%" disabled>
+              <span id="zoomLevel">100%</span>
+            </button>
+            <button class="tool-btn" type="button" id="zoomInBtn" aria-label="Zoom in" disabled>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <line x1="12" y1="6" x2="12" y2="18"/>
+                <line x1="6" y1="12" x2="18" y2="12"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="toolbar__group toolbar__group--workflow">
+            <button class="btn btn--ghost" type="button" id="autoBtn" disabled>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+              </svg>
+              Auto-detect
+            </button>
+            <button class="btn btn--ghost" type="button" id="customPatternsBtn" title="Add custom redaction patterns">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <line x1="12" y1="5" x2="12" y2="19"/>
+                <line x1="5" y1="12" x2="19" y2="12"/>
+              </svg>
+              Pattern<span class="custom-patterns-count" id="customPatternsCount" hidden>0</span>
+            </button>
+            <button class="btn btn--ghost" type="button" id="clearBtn" disabled>Clear</button>
+          </div>
+
+          <div class="toolbar__group toolbar__group--primary">
+            <span class="toolbar__count" id="rectCount" hidden>0 redactions</span>
+            <button class="btn btn--red" type="button" id="exportBtn" disabled>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              Export redacted
+            </button>
+          </div>
+
+        </div>
+
+        <div class="pending-bar" id="pendingBar" hidden>
+          <div class="pending-bar__title">
+            <strong class="pending-bar__title-num" id="pendingCount">0</strong>
+            <span class="pending-bar__title-label">proposed</span>
+          </div>
+          <div class="kind-chips" id="kindChips" aria-label="Detected types"></div>
+          <div class="pending-bar__actions">
+            <button class="pending-bar__btn" type="button" id="dismissAllBtn">Dismiss</button>
+            <button class="pending-bar__btn pending-bar__btn--accept" type="button" id="acceptAllBtn">Accept</button>
+          </div>
+        </div>
+      </div><!-- /ctrl-bar -->
+
+      <div class="pages" id="pages"></div>
+
+    </div>
+  </section>
+
+  <!-- ============================================================
+       PROOF — privacy claims with verification hooks
+       ============================================================ -->
+  <section class="section">
+    <div class="container">
+      <div class="section__head">
+        <span class="section__eyebrow">verify it yourself</span>
+        <h2 class="section__title">Privacy as an instrument, not a claim.</h2>
+        <p class="section__lede">Your PDFs never leave the tab. Every claim below is something you can confirm in your own browser before you trust this tool with anything sensitive.</p>
+      </div>
+      <div class="proof">
+        <article class="proof__item">
+          <span class="proof__num">01</span>
+          <h3 class="proof__title">No uploads</h3>
+          <p class="proof__body">Parsing and content-stream rewriting both run in your browser, using pdfjs-dist and pdf-lib. Open devtools, switch to the Network tab, redact a file: nothing fires. Bytes never leave this device.</p>
+          <button class="proof__verify" type="button" data-verify="network">F12 &rarr; Network &rarr; redact &rarr;</button>
+        </article>
+        <article class="proof__item">
+          <span class="proof__num">02</span>
+          <h3 class="proof__title">Real redaction, not a sticker</h3>
+          <p class="proof__body">Most browser redactors paint a black box on top of the text and call it done. The text is still in the file, ready to be copy-pasted out. We rewrite the page content stream to actually remove the targeted glyphs, then paint the box on for visual confirmation.</p>
+          <button class="proof__verify" type="button" data-verify="redaction">Open the export, search for it &rarr;</button>
+        </article>
+        <article class="proof__item">
+          <span class="proof__num">03</span>
+          <h3 class="proof__title">No tracking</h3>
+          <p class="proof__body">No analytics, no cookies, no fingerprinting. Custom regex patterns persist in localStorage on this device only. The PDF you opened lives in JS memory until you close the tab.</p>
+          <button class="proof__verify" type="button" data-verify="storage">F12 &rarr; Application &rarr; Storage &rarr;</button>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================
+       TAKE-IT-HOME — single file, self-host, source
+       ============================================================ -->
+  <section class="section home">
+    <div class="container">
+      <div class="section__head">
+        <span class="section__eyebrow">run it offline</span>
+        <h2 class="section__title">Don't trust the page. Take it home.</h2>
+        <p class="section__lede">A single HTML file you can drop on a USB stick. A static asset you can self-host on your intranet. The full source under MIT. Pick your level of paranoia.</p>
+      </div>
+      <div class="home__grid">
+        <article class="home__card">
+          <div class="home__top">
+            <div class="home__icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            </div>
+            <span class="home__label">single file</span>
+          </div>
+          <h3 class="home__title">Standalone HTML</h3>
+          <p class="home__desc"><code style="font-family:var(--font-mono);font-size:.92em;color:var(--text)">index.html</code> plus a <code style="font-family:var(--font-mono);font-size:.92em;color:var(--text)">vendor/</code> folder with pdfjs and pdf-lib bundled in. Drop the pair on a thumb drive, double-click, redact PDFs with no network at all. Content-Security-Policy locks the page to its own origin so it can't phone home even if a future change tried.</p>
+          <a class="home__cta" href="https://github.com/xjmani/pdf-redactor/archive/refs/heads/main.zip" target="_blank" rel="noopener" id="downloadHtml">Download (.zip) &rarr;</a>
+        </article>
+
+        <article class="home__card">
+          <div class="home__top">
+            <div class="home__icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M2 8h20"/><path d="M8 16h8"/></svg>
+            </div>
+            <span class="home__label">self-host</span>
+          </div>
+          <h3 class="home__title">Run it on your network</h3>
+          <p class="home__desc">Serve <code style="font-family:var(--font-mono);font-size:.92em;color:var(--text)">index.html</code> from your NAS, SharePoint, internal wiki, or any static host. Anyone who can reach the page can redact PDFs without bytes leaving your network.</p>
+          <a class="home__cta" href="https://github.com/xjmani/pdf-redactor#self-host" target="_blank" rel="noopener">Self-host guide &rarr;</a>
+        </article>
+
+        <article class="home__card">
+          <div class="home__top">
+            <div class="home__icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
+            </div>
+            <span class="home__label">open source</span>
+          </div>
+          <h3 class="home__title">View source</h3>
+          <p class="home__desc">Every line of code, MIT-licensed, on GitHub. Audit the redaction logic, fork the regex pack, extend it with your own patterns. Issues and PRs welcome.</p>
+          <a class="home__cta" href="https://github.com/xjmani/pdf-redactor" target="_blank" rel="noopener">github.com/xjmani/pdf-redactor &rarr;</a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <div class="dialog" id="customPatternsDialog" hidden role="dialog" aria-labelledby="customPatternsTitle">
+    <div class="dialog__panel">
+      <div class="dialog__head">
+        <h3 id="customPatternsTitle">Custom redaction patterns</h3>
+        <button class="dialog__close" type="button" id="closeCustomDialog" aria-label="Close">&times;</button>
+      </div>
+      <p class="dialog__hint">
+        Paste an example of the text you want to redact. Words BEFORE a separator (<code>:</code> <code>—</code> <code>-</code> <code>#</code> <code>=</code>) stay <strong>literal</strong> (the label). Tokens AFTER a separator become <strong>variable</strong>. Dashes auto-expand to also match em-dash, en-dash, and NUL (some PDFs render dashes as NUL bytes). Edit the regex below if needed.
+      </p>
+      <div class="dialog__inputrow dialog__inputrow--stack">
+        <input type="text" id="newPatternName" placeholder="Name (e.g. Customer ID, Store ID)" autocomplete="off" maxlength="32" />
+        <input type="text" id="newPatternInput" placeholder="Example text (e.g. IDX:1234567890)" autocomplete="off" />
+        <button class="btn btn--red" type="button" id="addPatternBtn" disabled>Add pattern</button>
+      </div>
+      <div class="dialog__regex">
+        <label for="newPatternRegex">Generated regex (editable):</label>
+        <input type="text" id="newPatternRegex" autocomplete="off" />
+        <span class="dialog__regex-status" id="newPatternStatus"></span>
+      </div>
+      <ul class="dialog__list" id="patternsList"></ul>
+      <p class="dialog__hint dialog__hint--small">
+        Saved on this device only. Auto-detect will run these alongside the built-in patterns.
+      </p>
+    </div>
+  </div>
+</main>
+
+<footer class="ftr">
+  <div class="container ftr__inner">
+    <span class="ftr__live" aria-hidden="true"></span>
+    <span class="ftr__brand-mini"><span class="x">x</span>jmani</span>
+    <span class="ftr__sep">·</span>
+    <span>Privacy-first browser tools</span>
+    <span class="ftr__sep">·</span>
+    <span>Client-only</span>
+    <span class="ftr__sep">·</span>
+    <span>MIT</span>
+    <span class="ftr__sep">·</span>
+    <span>&copy; 2026 Loyaltydraw.com Inc</span>
+    <span class="ftr__spacer" aria-hidden="true"></span>
+    <a href="https://github.com/xjmani/pdf-redactor" target="_blank" rel="noopener" data-ext id="ghLink">github</a>
+    <a href="https://xjmani.com/legal/privacy" data-ext>Privacy</a>
+    <a href="https://xjmani.com/contact" data-ext>Contact</a>
+    <a href="https://xjmani.com" data-ext>xjmani.com</a>
+  </div>
+</footer>
+
+<script type="module">
+  // Vendored locally — see ./vendor/. Versions pinned in commit:
+  //   pdfjs-dist@4.7.76, pdf-lib@1.17.1
+  // Loading from same origin keeps the standalone HTML usable with no
+  // network access after the initial download (CSP below also blocks any
+  // accidental external fetches).
+  import * as pdfjs from './vendor/pdf.min.mjs';
+  import { PDFDocument, PDFArray, PDFRef, PDFName, PDFRawStream, decodePDFRawStream, rgb } from './vendor/pdf-lib.min.mjs';
+  pdfjs.GlobalWorkerOptions.workerSrc = './vendor/pdf.worker.min.mjs';
+
+  // ---- state ----------------------------------------------------------------
+  const state = {
+    pdfDoc: null,        // pdfjs document
+    fileName: '',
+    fileBytes: null,     // ArrayBuffer of the original PDF, for export later
+    pages: [],           // [{ pageNum, viewport, canvas, overlay, scale, rects: [{x,y,w,h,id,pending}] }]
+    nextRectId: 1,
+    disabledKinds: new Set(), // kinds the user toggled off via the chip bar
+    zoom: 1,             // current zoom multiplier; 1 = fit-to-container
+    baseWidth: null,     // container width measured at first render; zoom scales from this
+    customPatterns: [],  // user-defined regex patterns: [{ id, source, regex }]
+    mode: 'redact',      // 'redact' (drag to draw) | 'select' (text copy)
+  };
+
+  // ---- DOM refs -------------------------------------------------------------
+  const $drop      = document.getElementById('drop');
+  const $fileInput = document.getElementById('fileInput');
+  const $pickBtn   = document.getElementById('pickBtn');
+  const $themeBtn  = document.getElementById('themeBtn');
+  const $workspace = document.getElementById('workspace');
+  const $rectCount = document.getElementById('rectCount');
+  const $clearBtn  = document.getElementById('clearBtn');
+  const $exportBtn = document.getElementById('exportBtn');
+  const $autoBtn   = document.getElementById('autoBtn');
+  const $pages     = document.getElementById('pages');
+  const $pendingBar  = document.getElementById('pendingBar');
+  const $pendingCount = document.getElementById('pendingCount');
+  const $acceptAllBtn = document.getElementById('acceptAllBtn');
+  const $dismissAllBtn = document.getElementById('dismissAllBtn');
+  const $kindChips    = document.getElementById('kindChips');
+  const $zoomOutBtn   = document.getElementById('zoomOutBtn');
+  const $zoomInBtn    = document.getElementById('zoomInBtn');
+  const $zoomLevelBtn = document.getElementById('zoomLevelBtn');
+  const $zoomLevel    = document.getElementById('zoomLevel');
+  const $customPatternsBtn   = document.getElementById('customPatternsBtn');
+  const $customPatternsCount = document.getElementById('customPatternsCount');
+  const $customPatternsDialog= document.getElementById('customPatternsDialog');
+  const $closeCustomDialog   = document.getElementById('closeCustomDialog');
+  const $newPatternName      = document.getElementById('newPatternName');
+  const $newPatternInput     = document.getElementById('newPatternInput');
+  const $newPatternRegex     = document.getElementById('newPatternRegex');
+  const $newPatternStatus    = document.getElementById('newPatternStatus');
+  const $addPatternBtn       = document.getElementById('addPatternBtn');
+  const $patternsList        = document.getElementById('patternsList');
+  const $modeRedactBtn       = document.getElementById('modeRedactBtn');
+  const $modeSelectBtn       = document.getElementById('modeSelectBtn');
+
+  // ---- theme toggle ---------------------------------------------------------
+  const savedTheme = localStorage.getItem('xj-theme');
+  if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+  $themeBtn.addEventListener('click', () => {
+    const cur = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+    document.documentElement.dataset.theme = cur;
+    localStorage.setItem('xj-theme', cur);
+  });
+
+  // ---- drop zone ------------------------------------------------------------
+  $pickBtn.addEventListener('click', () => $fileInput.click());
+  $drop.addEventListener('click', (e) => {
+    if (e.target === $drop || e.target.closest('.drop__icon, .drop__title, .drop__sub')) {
+      $fileInput.click();
+    }
+  });
+  $fileInput.addEventListener('change', (e) => {
+    const file = e.target.files?.[0];
+    if (file) loadFile(file);
+  });
+  ['dragenter','dragover'].forEach(ev =>
+    $drop.addEventListener(ev, (e) => { e.preventDefault(); $drop.dataset.active = 'true'; })
+  );
+  ['dragleave','drop'].forEach(ev =>
+    $drop.addEventListener(ev, (e) => { e.preventDefault(); $drop.dataset.active = 'false'; })
+  );
+  $drop.addEventListener('drop', (e) => {
+    const file = e.dataTransfer?.files?.[0];
+    if (file && file.type === 'application/pdf') loadFile(file);
+  });
+
+  // ---- mode toggle ----------------------------------------------------------
+
+  // ---- clear ----------------------------------------------------------------
+  $clearBtn.addEventListener('click', () => {
+    state.pages.forEach(p => {
+      p.rects = [];
+      renderRects(p);
+    });
+    state.disabledKinds.clear();
+    setAutoEnabled(true);
+    updateCount();
+  });
+
+  // Toggle the toolbar + footer auto-detect buttons together so they stay
+  function setAutoEnabled(enabled) {
+    $autoBtn.disabled = !enabled;
+    $autoBtn.title = enabled ? '' : 'Already detected, clear redactions to re-run';
+  }
+
+  // ---- auto-detect ----------------------------------------------------------
+  $autoBtn.addEventListener('click', autoDetect);
+
+  // accept-all and dismiss-all only act on currently-visible kinds. Pending
+  // rects whose kind is toggled off via the chip bar stay untouched, so the
+  // user can re-enable them later.
+  function isKindVisible(kind) {
+    return !kind || !state.disabledKinds.has(kind);
+  }
+
+  $acceptAllBtn.addEventListener('click', () => {
+    let n = 0;
+    for (const p of state.pages) {
+      let changed = false;
+      for (const r of p.rects) {
+        if (r.pending && isKindVisible(r.kind)) {
+          r.pending = false;
+          delete r.kind;
+          n++;
+          changed = true;
+        }
+      }
+      if (changed) renderRects(p);
+    }
+    updateCount();
+    if (n > 0) showResult(`Accepted ${n} proposed redaction${n === 1 ? '' : 's'}.`, 'ok');
+  });
+  $dismissAllBtn.addEventListener('click', () => {
+    // Dismiss ALL pending, including those hidden via toggled-off chips —
+    // the user is signaling "I'm done with these proposals; close the bar."
+    // Re-running auto-detect later starts fresh.
+    let n = 0;
+    for (const p of state.pages) {
+      const before = p.rects.length;
+      p.rects = p.rects.filter(r => !r.pending);
+      if (p.rects.length !== before) {
+        n += before - p.rects.length;
+        renderRects(p);
+      }
+    }
+    state.disabledKinds.clear();
+    updateCount();
+    if (n > 0) showResult(`Dismissed ${n} proposed redaction${n === 1 ? '' : 's'}.`, 'warn');
+  });
+
+  // ---- export ---------------------------------------------------------------
+  $exportBtn.addEventListener('click', exportRedacted);
+
+  // ---- zoom -----------------------------------------------------------------
+  let zoomBusy = false;
+  async function changeZoom(factor) {
+    if (zoomBusy || !state.pdfDoc || state.pages.length === 0) return;
+    zoomBusy = true;
+    const next = Math.max(0.4, Math.min(3.0, state.zoom * factor));
+    if (Math.abs(next - state.zoom) < 0.001) { zoomBusy = false; return; }
+    state.zoom = next;
+    $zoomLevel.textContent = `${Math.round(state.zoom * 100)}%`;
+    await applyZoom();
+    zoomBusy = false;
+  }
+  $zoomOutBtn.addEventListener('click', () => changeZoom(0.85));
+  $zoomInBtn.addEventListener('click', () => changeZoom(1 / 0.85));
+  $zoomLevelBtn.addEventListener('click', async () => {
+    if (zoomBusy || state.zoom === 1) return;
+    zoomBusy = true;
+    state.zoom = 1;
+    $zoomLevel.textContent = '100%';
+    await applyZoom();
+    zoomBusy = false;
+  });
+
+  // Re-render every page at state.zoom * state.baseWidth, scaling existing
+  // rect coordinates so they stay aligned with the document text.
+  async function applyZoom() {
+    const targetWidth = state.baseWidth * state.zoom;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    for (const p of state.pages) {
+      const oldScale = p.scale;
+      const rawViewport = p.page.getViewport({ scale: 1 });
+      const newScale = targetWidth / rawViewport.width;
+      const ratio = newScale / oldScale;
+      if (Math.abs(ratio - 1) < 0.001) continue;
+
+      // Scale stored rects (in viewport pixels) so they track the new canvas.
+      for (const r of p.rects) {
+        r.x *= ratio; r.y *= ratio;
+        r.w *= ratio; r.h *= ratio;
+      }
+
+      const newViewport = p.page.getViewport({ scale: newScale });
+      p.viewport = newViewport;
+      p.scale = newScale;
+      p.root.style.width  = `${newViewport.width}px`;
+      p.root.style.height = `${newViewport.height}px`;
+
+      p.canvas.width  = Math.floor(newViewport.width * dpr);
+      p.canvas.height = Math.floor(newViewport.height * dpr);
+      p.canvas.style.width  = `${newViewport.width}px`;
+      p.canvas.style.height = `${newViewport.height}px`;
+      const ctx = p.canvas.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      await p.page.render({ canvasContext: ctx, viewport: newViewport }).promise;
+
+      // Re-render text layer at the new scale so the selectable spans
+      // stay aligned with the visible glyphs.
+      if (p.textLayer) await renderTextLayer(p.page, newViewport, p.textLayer);
+
+      renderRects(p);
+    }
+  }
+
+  // ---- custom redaction patterns -------------------------------------------
+  // Convert a user-pasted example into a regex.
+  //   - Digit runs                  → \d{N}
+  //   - Alphanumeric tokens that come AFTER a separator (`:`, `—`, `–`, `-`,
+  //     `#`, `=`) → variable character classes (\d/[A-Z]/[A-Za-z0-9]/etc.)
+  //     of the same length. These are the "value" parts of a label-value
+  //     construction like "Customer ID— Azq8XlSrLLzCGCG3E".
+  //   - Words BEFORE the first separator → kept literal (they're labels:
+  //     "Invoice", "Customer ID", "IDX", etc.)
+  //   - Special chars and whitespace → literal.
+  // Word boundaries are added at start and end so patterns don't match
+  // mid-token by accident.
+  const SEPARATOR_RE = /[:#=\-‐-―−]/;
+
+  function generateRegexFromExample(source) {
+    if (!source) return '';
+    // Tokenize into runs of word / whitespace / special chars.
+    const tokens = [];
+    for (let i = 0; i < source.length; ) {
+      const ch = source[i];
+      let type, j = i;
+      if (/\w/.test(ch)) {
+        type = 'word';
+        while (j < source.length && /\w/.test(source[j])) j++;
+      } else if (/\s/.test(ch)) {
+        type = 'space';
+        while (j < source.length && /\s/.test(source[j])) j++;
+      } else {
+        type = 'special';
+        while (j < source.length && !/[\w\s]/.test(source[j])) j++;
+      }
+      tokens.push({ type, value: source.slice(i, j) });
+      i = j;
+    }
+    // Build the regex, classifying word tokens by position relative to a
+    // recognized separator on their left.
+    let regex = '';
+    let sepSeenBefore = false;
+    for (let k = 0; k < tokens.length; k++) {
+      const t = tokens[k];
+      if (t.type === 'space') {
+        regex += t.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      } else if (t.type === 'special') {
+        // A single dash/hyphen gets expanded to a class that catches all
+        // Unicode dash variants plus NUL. Some PDF generators substitute
+        // these for ASCII hyphen-minus (and a small number map a dash
+        // glyph to byte 0x00 in their ToUnicode map), so the regex must
+        // match all of them to find the example pattern in real text.
+        if (t.value.length === 1 && /[-‐-―−]/.test(t.value)) {
+          regex += '[\\-‐-―−\\u0000]';
+        } else {
+          regex += t.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        }
+        if (SEPARATOR_RE.test(t.value)) sepSeenBefore = true;
+      } else {
+        regex += classifyWordToken(t.value, sepSeenBefore);
+      }
+    }
+    return '\\b' + regex + '\\b';
+  }
+
+  // Common label words — kept literal even when they're long all-upper
+  // (otherwise "INVOICE NUMBER JVFVVZVY-0002" would treat INVOICE as a
+  // value). Add to this list as needed.
+  const COMMON_LABEL_WORDS = new Set([
+    'INVOICE','ORDER','NUMBER','CUSTOMER','CLIENT','ACCOUNT','REFERENCE',
+    'RECEIPT','BILL','PRODUCT','ITEM','TICKET','BOOKING','CONFIRMATION',
+    'TRANSACTION','REGISTRATION','MEMBER','USER','SUBSCRIPTION','PAYMENT',
+    'CONTRACT','AGREEMENT','POLICY','LICENSE','TENANT','TRACKING','SESSION',
+    'NAME','EMAIL','PHONE','ADDRESS','TYPE','DATE','TIME','STATUS','TOTAL',
+    'AMOUNT','PRICE','QUANTITY','CODE','KEY','FROM','TO','VIA','REF','NO',
+  ]);
+
+  // Decide whether a word token is a "label" (literal) or a "value"
+  // (variable). The goal: from a single example like "JVFVVZVY-0002" or
+  // "aaFVdZVv-1030", generate a regex that matches ALL similarly-shaped
+  // IDs in the document regardless of letter case. So letter sequences
+  // that look like values use `[A-Za-z]{N}` (case-insensitive), not
+  // `[A-Z]{N}`. Label words stay literal.
+  function classifyWordToken(t, afterSeparator) {
+    // Pure digits → always a variable.
+    if (/^\d+$/.test(t)) return `\\d{${t.length}}`;
+    // Mixed alphanumeric (letters AND digits) → always variable.
+    if (/\d/.test(t) && /[A-Za-z]/.test(t)) {
+      return `[A-Za-z0-9]{${t.length}}`;
+    }
+
+    // Pure-letter token from here on.
+    const allUpper  = /^[A-Z]+$/.test(t);
+    const allLower  = /^[a-z]+$/.test(t);
+    const titleCase = /^[A-Z][a-z]+$/.test(t);
+
+    // Known English label word → always literal (so "Invoice", "NUMBER",
+    // "Order" stay as-is even when long enough to look like a value).
+    if (COMMON_LABEL_WORDS.has(t.toUpperCase())) return t;
+
+    // Before any separator, strongly bias to LITERAL (the user is most
+    // likely typing a label prefix). After a separator, bias to VALUE.
+    if (!afterSeparator) {
+      if (titleCase) return t;                  // "Invoice", "Customer"
+      if (allLower) return t;                   // "number", "of"
+      if (allUpper && t.length < 6) return t;   // short abbreviations: ID, USA
+    }
+
+    // Everything else is a value: variable case-insensitive letter class
+    // of the same length. Catches JVFVVZVY (all caps), aaFVdZVv (mixed),
+    // and abcdefgh (all lower) under a single pattern when generated from
+    // any one of those examples.
+    return `[A-Za-z]{${t.length}}`;
+  }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
+  }
+  function loadCustomPatterns() {
+    try {
+      const data = localStorage.getItem('xj-custom-patterns');
+      if (data) {
+        const parsed = JSON.parse(data);
+        if (Array.isArray(parsed)) state.customPatterns = parsed;
+      }
+    } catch {}
+    renderCustomPatternsList();
+    updateCustomPatternsBadge();
+  }
+  function saveCustomPatterns() {
+    try {
+      localStorage.setItem('xj-custom-patterns', JSON.stringify(state.customPatterns));
+    } catch {}
+    updateCustomPatternsBadge();
+  }
+  function updateCustomPatternsBadge() {
+    const n = state.customPatterns.length;
+    if (n === 0) {
+      $customPatternsCount.hidden = true;
+    } else {
+      $customPatternsCount.hidden = false;
+      $customPatternsCount.textContent = String(n);
+    }
+  }
+  function renderCustomPatternsList() {
+    $patternsList.innerHTML = '';
+    for (const p of state.customPatterns) {
+      const li = document.createElement('li');
+      li.innerHTML = `
+        <span class="source"><strong>${escapeHtml(p.name || 'Custom')}</strong></span>
+        <code class="regex">${escapeHtml(p.source)} → /${escapeHtml(p.regex)}/g</code>
+        <button class="remove" type="button" aria-label="Remove pattern">&times;</button>
+      `;
+      li.querySelector('.remove').addEventListener('click', () => {
+        state.customPatterns = state.customPatterns.filter(x => x.id !== p.id);
+        renderCustomPatternsList();
+        saveCustomPatterns();
+        rearmAutoDetect();
+      });
+      $patternsList.appendChild(li);
+    }
+  }
+
+  // After the user changes custom patterns, re-enable auto-detect so they
+  // can re-run with the new pattern set without having to click Clear
+  // (which would wipe their existing redactions).
+  function rearmAutoDetect() {
+    if (state.pdfDoc && state.pages.length > 0) {
+      setAutoEnabled(true);
+    }
+  }
+
+  $customPatternsBtn.addEventListener('click', () => {
+    $customPatternsDialog.hidden = false;
+    setTimeout(() => $newPatternInput.focus(), 50);
+  });
+  $closeCustomDialog.addEventListener('click', () => {
+    $customPatternsDialog.hidden = true;
+    $newPatternInput.value = '';
+    $newPatternRegex.value = '';
+    $newPatternStatus.textContent = '';
+    $addPatternBtn.disabled = true;
+  });
+  // Click-outside-to-close (only when clicking the backdrop, not the panel).
+  $customPatternsDialog.addEventListener('click', (e) => {
+    if (e.target === $customPatternsDialog) $closeCustomDialog.click();
+  });
+
+  $newPatternInput.addEventListener('input', () => {
+    const generated = generateRegexFromExample($newPatternInput.value);
+    $newPatternRegex.value = generated;
+    validateNewPatternRegex();
+  });
+  $newPatternRegex.addEventListener('input', validateNewPatternRegex);
+
+  function validateNewPatternRegex() {
+    const r = $newPatternRegex.value.trim();
+    if (!r) {
+      $newPatternStatus.textContent = '';
+      $newPatternStatus.dataset.state = '';
+      $addPatternBtn.disabled = true;
+      return;
+    }
+    try {
+      new RegExp(r, 'g');
+      $newPatternStatus.textContent = 'Valid pattern';
+      $newPatternStatus.dataset.state = 'ok';
+      $addPatternBtn.disabled = false;
+    } catch (err) {
+      $newPatternStatus.textContent = 'Invalid: ' + err.message;
+      $newPatternStatus.dataset.state = 'error';
+      $addPatternBtn.disabled = true;
+    }
+  }
+
+  $addPatternBtn.addEventListener('click', () => {
+    const source = $newPatternInput.value.trim();
+    const regex  = $newPatternRegex.value.trim();
+    let name = $newPatternName.value.trim();
+    if (!source || !regex) return;
+    try { new RegExp(regex, 'g'); } catch { return; }
+    // Default name if user left the field blank.
+    if (!name) {
+      const usedNums = state.customPatterns
+        .map(p => /^Custom (\d+)$/.exec(p.name || ''))
+        .map(m => m ? +m[1] : 0);
+      const next = usedNums.length ? Math.max(...usedNums) + 1 : 1;
+      name = `Custom ${next}`;
+    }
+    state.customPatterns.push({
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      name,
+      source,
+      regex,
+    });
+    renderCustomPatternsList();
+    saveCustomPatterns();
+    rearmAutoDetect();
+    $newPatternName.value = '';
+    $newPatternInput.value = '';
+    $newPatternRegex.value = '';
+    $newPatternStatus.textContent = 'Added. Re-run auto-detect to apply.';
+    $newPatternStatus.dataset.state = 'ok';
+    $addPatternBtn.disabled = true;
+    $newPatternName.focus();
+  });
+
+  // Restore previously-saved patterns on load.
+  loadCustomPatterns();
+
+  // ---- cursor mode toggle (Mark vs Select) ---------------------------------
+  function setMode(m) {
+    state.mode = (m === 'select') ? 'select' : 'redact';
+    $workspace.dataset.mode = state.mode;
+    $modeRedactBtn.setAttribute('aria-pressed', String(state.mode === 'redact'));
+    $modeSelectBtn.setAttribute('aria-pressed', String(state.mode === 'select'));
+  }
+  $modeRedactBtn.addEventListener('click', () => setMode('redact'));
+  $modeSelectBtn.addEventListener('click', () => setMode('select'));
+  setMode('redact');
+
+  async function exportRedacted() {
+    const totalRects = state.pages.reduce((a, p) => a + p.rects.length, 0);
+    if (totalRects === 0) {
+      showResult('No redactions drawn. Drag on a page to mark a region.', 'warn');
+      return;
+    }
+    setBusy(true);
+    showResult('', 'clear');
+
+    try {
+      const pdfDoc = await PDFDocument.load(state.fileBytes.slice(0));
+
+      let totalBlanked = 0;
+      const exportDebug = { pages: [] };
+      for (const p of state.pages) {
+        if (p.rects.length === 0) continue;
+        const pdfPage = pdfDoc.getPage(p.pageNum - 1);
+        const { width: pdfWidth, height: pdfHeight } = pdfPage.getSize();
+
+        // Convert each viewport-pixel rect into PDF user-space (origin bottom-left).
+        const pdfRects = p.rects.map(r => ({
+          x: r.x / p.scale,
+          y: pdfHeight - (r.y + r.h) / p.scale,
+          w: r.w / p.scale,
+          h: r.h / p.scale,
+          pending: !!r.pending,
+        }));
+
+        // Single atomic content-stream replacement that does BOTH the
+        // surgical text blanking AND the visual black-rectangle paint.
+        // No more pdf-lib drawRectangle (which was re-adding the original
+        // un-blanked content stream behind the scenes).
+        const blanked = await redactAndDrawOnPage(pdfDoc, pdfPage, pdfRects);
+        totalBlanked += blanked;
+        exportDebug.pages.push({
+          pageNum: p.pageNum,
+          rectCount: p.rects.length,
+          pendingCount: p.rects.filter(r => r.pending).length,
+          pdfRects,
+          blanked,
+        });
+      }
+      console.log('[xjmani-redactor] export:', { totalBlanked, pages: exportDebug.pages });
+      window.xjmaniLastExport = exportDebug;
+
+      // ---- POST-SAVE DIAGNOSTIC ----------------------------------------
+      try {
+        const outBytesPreview = await pdfDoc.save({ useObjectStreams: false });
+        const reloaded = await PDFDocument.load(outBytesPreview.slice(0));
+        for (const p of state.pages) {
+          if (p.rects.length === 0) continue;
+          const reloadedPage = reloaded.getPage(p.pageNum - 1);
+          const contents = reloadedPage.node.get(PDFName.of('Contents'));
+          const contentsType = contents?.constructor?.name ?? typeof contents;
+
+          // Handle both single PDFRef-to-stream AND PDFArray-of-stream-refs.
+          let streamRefs = [];
+          if (contents instanceof PDFArray) {
+            streamRefs = contents.asArray();
+          } else if (contents) {
+            streamRefs = [contents];
+          }
+
+          let allText = '';
+          const streamShapes = [];
+          for (const ref of streamRefs) {
+            const stream = ref instanceof PDFRef ? reloaded.context.lookup(ref) : ref;
+            streamShapes.push(stream?.constructor?.name || typeof stream);
+            try {
+              if (stream && stream.dict) {
+                const decoded = decodePDFRawStream(stream).getBytes();
+                allText += new TextDecoder('latin1').decode(decoded);
+              }
+            } catch (decodeErr) {
+              streamShapes[streamShapes.length - 1] += ` (decode failed: ${decodeErr.message})`;
+            }
+          }
+
+          const hasBlankedTj = /\(\s*\)\s*Tj/.test(allText);
+          const hasBlankedTJ = /\[\s*\]\s*TJ/.test(allText);
+
+          // List XObjects on the page Resources.
+          let xobjKeys = [];
+          try {
+            const resources = reloadedPage.node.get(PDFName.of('Resources'));
+            const resDict = resources instanceof PDFRef ? reloaded.context.lookup(resources) : resources;
+            const xobj = resDict?.get?.(PDFName.of('XObject'));
+            const xobjDict = xobj instanceof PDFRef ? reloaded.context.lookup(xobj) : xobj;
+            if (xobjDict?.entries) xobjKeys = [...xobjDict.entries()].map(([k]) => k.toString());
+            else if (xobjDict?.keys) xobjKeys = xobjDict.keys().map(k => k.toString());
+          } catch {}
+
+          console.log('[xjmani-redactor] post-save page', p.pageNum, {
+            contentsType,
+            streamCount: streamRefs.length,
+            streamShapes,
+            totalContentBytes: allText.length,
+            hasBlankedTj,
+            hasBlankedTJ,
+            xobjectsOnPage: xobjKeys,
+            contentSnippet: allText.slice(0, 600),
+          });
+        }
+      } catch (diagErr) {
+        console.warn('[xjmani-redactor] post-save diagnostic failed:', diagErr);
+      }
+      // ----------------------------------------------------------------
+
+      const outBytes = await pdfDoc.save({ useObjectStreams: false });
+
+      // 3. Verify by re-extracting text from the saved PDF and checking the
+      //    redacted regions are empty.
+      const verify = await verifyRedaction(outBytes);
+
+      // 4. Trigger download.
+      downloadBlob(outBytes, state.fileName.replace(/\.pdf$/i, '') + '-redacted.pdf');
+
+      const verifyMsg = verify.leakedItems === 0
+        ? `Verified clean: re-extracted text from output, found nothing in any redacted region.`
+        : `Warning: ${verify.leakedItems} text item${verify.leakedItems === 1 ? '' : 's'} still appears inside a redacted region in the output. Likely a subsetted-font case the v1 surgery missed; the visual is correct but the underlying bytes may still be extractable.`;
+
+      showResult(
+        `Redacted ${totalRects} region${totalRects === 1 ? '' : 's'} across ${state.pages.filter(p => p.rects.length).length} page${state.pages.filter(p => p.rects.length).length === 1 ? '' : 's'}. ` +
+        `Blanked ${totalBlanked} content-stream text operator${totalBlanked === 1 ? '' : 's'}. ${verifyMsg}`,
+        verify.leakedItems === 0 ? 'ok' : 'warn'
+      );
+    } catch (err) {
+      console.error(err);
+      showResult('Redaction failed: ' + (err.message || err), 'err');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function setBusy(busy) {
+    $exportBtn.disabled = busy;
+    $exportBtn.style.opacity = busy ? '0.6' : '';
+    $exportBtn.firstChild && ($exportBtn.lastChild.textContent = busy ? ' Redacting…' : ' Export redacted');
+  }
+
+  function downloadBlob(bytes, filename) {
+    const blob = new Blob([bytes], { type: 'application/pdf' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  }
+
+  // --------------------------------------------------------------------------
+  // Content stream surgery.
+  //
+  // PDF content streams are a sequence of operators in postfix form:
+  //   100 700 Td (Hello) Tj
+  // The walker (walkAndBlank, below) tokenizes the bytes, tracks the text
+  // matrix (Tm / Td / TD / T*) and graphics state (q / Q / cm), and for each
+  // text-showing operator (Tj, TJ, ', ") whose computed glyph positions fall
+  // inside a redaction rect, removes the affected glyphs from the operand.
+  // The page's other text and visual layout is untouched, so unredacted
+  // content stays native and selectable in the exported PDF.
+  // --------------------------------------------------------------------------
+
+  // Replaces the page's /Contents with a single new stream that contains
+  // (1) the surgically blanked text operators and (2) black rectangles drawn
+  // over the redaction regions, atomically. Drawing the rectangles inline
+  // (rather than via pdf-lib's drawRectangle afterwards) avoids re-adding
+  // the original un-blanked stream to the /Contents array on save.
+  async function redactAndDrawOnPage(pdfDoc, pdfPage, pdfRects) {
+    const ctx = pdfDoc.context;
+    const contentsEntry = pdfPage.node.get(PDFName.of('Contents'));
+    if (!contentsEntry) return 0;
+
+    let streamRefs;
+    if (contentsEntry instanceof PDFArray) {
+      streamRefs = contentsEntry.asArray();
+    } else {
+      streamRefs = [contentsEntry];
+    }
+
+    const decodedParts = [];
+    for (const ref of streamRefs) {
+      const stream = ref instanceof PDFRef ? ctx.lookup(ref) : ref;
+      if (!(stream instanceof PDFRawStream)) continue;
+      const decoded = decodePDFRawStream(stream).getBytes();
+      if (!decoded || !decoded.length) continue;
+      decodedParts.push(decoded, new Uint8Array([0x0A]));
+    }
+    if (decodedParts.length === 0) return 0;
+
+    const totalLen = decodedParts.reduce((a, b) => a + b.length, 0);
+    const combined = new Uint8Array(totalLen);
+    let off = 0;
+    for (const p of decodedParts) { combined.set(p, off); off += p.length; }
+
+    // Build a font-name → font-info map for this page. Each entry has
+    // byte-width (1 simple, 2 CID), per-glyph widths (from /Widths or /W),
+    // and a default width fallback. The walker uses widths to advance the
+    // cursor accurately so a 30-char line doesn't drift its boundary glyph
+    // into a redaction rect.
+    const fontInfoMap = buildFontInfoMap(pdfDoc, pdfPage);
+
+    // Surgically blank text-show operators that fall inside any rect.
+    const { modified, blanked, finalCtm } = walkAndBlank(combined, pdfRects, fontInfoMap);
+
+    // Reset the CTM to identity before appending the rectangle drawing
+    // operators. Some PDF generators apply a page-level transform such as
+    // `0.24 0 0 -0.24 0 792 cm` at the top of the stream with no matching
+    // `q` to restore from, leaving a non-identity CTM active at end-of-
+    // stream. Emitting `inv(finalCtm) cm` collapses the CTM back to
+    // identity so the rectangle coordinates below are interpreted as
+    // user space.
+    const inv = invertMatrix(finalCtm);
+    let rectOps = '\nq\n';
+    rectOps += `${inv.map(n => n.toFixed(6)).join(' ')} cm\n`;
+    rectOps += '0 0 0 rg\n';
+    for (const r of pdfRects) {
+      rectOps += `${r.x.toFixed(3)} ${r.y.toFixed(3)} ${r.w.toFixed(3)} ${r.h.toFixed(3)} re f\n`;
+    }
+    rectOps += 'Q\n';
+    const rectBytes = new TextEncoder().encode(rectOps);
+
+    const finalBytes = new Uint8Array(modified.length + rectBytes.length);
+    finalBytes.set(modified, 0);
+    finalBytes.set(rectBytes, modified.length);
+
+    // Replace the page's Contents with a single new stream that holds both
+    // the surgically blanked text operators and the rectangle drawing,
+    // atomically.
+    const newStream = ctx.flateStream(finalBytes);
+    const newRef = ctx.register(newStream);
+    pdfPage.node.set(PDFName.of('Contents'), newRef);
+
+    return blanked;
+  }
+
+  // --------------------------------------------------------------------------
+  // Reads the page's /Resources/Font dict and returns a map of font names
+  // ('F1', 'F2', …) to font info: byte-width (1 simple, 2 CID/Type0), the
+  // /Widths or /W per-glyph width table, and a default width fallback.
+  //
+  // Per-glyph widths are required for accurate cursor positioning: a fixed
+  // 0.6-em average drifts a fraction of a unit per character, and over a
+  // ~30-character line the accumulated drift is enough to misclassify a
+  // boundary glyph as inside the redaction rect.
+  // --------------------------------------------------------------------------
+  function buildFontInfoMap(pdfDoc, pdfPage) {
+    const map = new Map();
+    const ctx = pdfDoc.context;
+    const deref = (obj) => (obj instanceof PDFRef ? ctx.lookup(obj) : obj);
+    const nameStr = (obj) => {
+      if (!obj) return '';
+      if (typeof obj.asString === 'function') return obj.asString();
+      if (typeof obj.encodedName === 'string') return obj.encodedName;
+      return String(obj);
+    };
+    const numberValue = (obj) => {
+      if (obj == null) return null;
+      if (typeof obj === 'number') return obj;
+      if (typeof obj.numberValue === 'function') return obj.numberValue();
+      if (typeof obj.value === 'number') return obj.value;
+      const n = parseFloat(String(obj));
+      return Number.isFinite(n) ? n : null;
+    };
+
+    // pdf-lib's PDFPageLeaf.Resources() also walks up to inherited /Pages
+    // entries; fall back to a direct .get on older builds that don't expose it.
+    let resources = typeof pdfPage.node.Resources === 'function'
+      ? pdfPage.node.Resources()
+      : pdfPage.node.get(PDFName.of('Resources'));
+    resources = deref(resources);
+    if (!resources || typeof resources.get !== 'function') return map;
+
+    const fontDict = deref(resources.get(PDFName.of('Font')));
+    if (!fontDict || typeof fontDict.entries !== 'function') return map;
+
+    for (const [nameKey, fontVal] of fontDict.entries()) {
+      const font = deref(fontVal);
+      if (!font || typeof font.get !== 'function') continue;
+
+      const subtypeName = nameStr(font.get(PDFName.of('Subtype')));
+      let byteWidth = 1;
+      const widths = new Map();
+      let defaultWidth = 0;
+
+      if (subtypeName === '/Type0') {
+        // Composite (Type0) font. Width info lives on the descendant
+        // CIDFont's /W array, with /DW as the default.
+        byteWidth = 2;
+        const descFonts = deref(font.get(PDFName.of('DescendantFonts')));
+        if (descFonts && typeof descFonts.asArray === 'function') {
+          const arr = descFonts.asArray();
+          if (arr.length > 0) {
+            const cidFont = deref(arr[0]);
+            if (cidFont && typeof cidFont.get === 'function') {
+              const dw = numberValue(deref(cidFont.get(PDFName.of('DW'))));
+              defaultWidth = dw != null ? dw : 1000;
+              const wArr = deref(cidFont.get(PDFName.of('W')));
+              if (wArr && typeof wArr.asArray === 'function') {
+                parseCIDWArray(wArr.asArray(), widths, deref, numberValue);
+              }
+            }
+          }
+        }
+      } else {
+        // Simple font (Type1, TrueType, MMType1, Type3). Identity-H or
+        // Identity-V on a TrueType means 2-byte access; otherwise 1-byte.
+        const encName = nameStr(deref(font.get(PDFName.of('Encoding'))));
+        if (encName === '/Identity-H' || encName === '/Identity-V') byteWidth = 2;
+
+        const firstChar = numberValue(font.get(PDFName.of('FirstChar')));
+        const widthsArr = deref(font.get(PDFName.of('Widths')));
+        const mw = numberValue(font.get(PDFName.of('MissingWidth')));
+        defaultWidth = mw != null ? mw : 0;
+
+        if (widthsArr && typeof widthsArr.asArray === 'function' && firstChar != null) {
+          const arr = widthsArr.asArray();
+          for (let i = 0; i < arr.length; i++) {
+            const w = numberValue(deref(arr[i]));
+            if (w != null) widths.set(firstChar + i, w);
+          }
+        }
+      }
+
+      const keyStr = nameStr(nameKey);
+      const cleanName = keyStr.startsWith('/') ? keyStr.slice(1) : keyStr;
+      if (cleanName) map.set(cleanName, { byteWidth, widths, defaultWidth });
+    }
+
+    return map;
+  }
+
+  // /W array forms (PDF 9.7.4.3):
+  //   c [ w1 w2 ... ]    — widths for c, c+1, c+2, ...
+  //   c1 c2 w            — same width w for c1..c2 inclusive
+  function parseCIDWArray(arr, widths, deref, numberValue) {
+    let i = 0;
+    while (i < arr.length) {
+      const c = numberValue(deref(arr[i]));
+      if (c == null) { i++; continue; }
+      const next = deref(arr[i + 1]);
+      if (next && typeof next.asArray === 'function') {
+        const widthArr = next.asArray();
+        for (let j = 0; j < widthArr.length; j++) {
+          const w = numberValue(deref(widthArr[j]));
+          if (w != null) widths.set(c + j, w);
+        }
+        i += 2;
+      } else {
+        const cLast = numberValue(next);
+        const w = numberValue(deref(arr[i + 2]));
+        if (cLast != null && w != null) {
+          for (let cid = c; cid <= cLast; cid++) widths.set(cid, w);
+        }
+        i += 3;
+      }
+    }
+  }
+
+  // Reasonable fallback when the font dict lacks widths (e.g. corrupt PDF
+  // or an unusual font subtype). Keeps the cursor advancing so the walker
+  // doesn't loop, at the cost of slight drift on that particular font.
+  function lookupGlyphWidth(fontInfo, charCode) {
+    if (!fontInfo) return 600;
+    const w = fontInfo.widths.get(charCode);
+    if (w != null && w > 0) return w;
+    if (fontInfo.defaultWidth > 0) return fontInfo.defaultWidth;
+    return 600;
+  }
+
+  // Decodes a glyph item's textBytes (which holds raw content-stream bytes
+  // like "0049" hex or 0x49 literal) into a numeric character code suitable
+  // for /Widths or /W lookup.
+  function getGlyphCharCode(textBytes, isHex) {
+    if (isHex) {
+      let code = 0;
+      for (const b of textBytes) {
+        const hv = b >= 0x30 && b <= 0x39 ? b - 0x30
+                 : b >= 0x41 && b <= 0x46 ? b - 0x41 + 10
+                 : b >= 0x61 && b <= 0x66 ? b - 0x61 + 10
+                 : 0;
+        code = code * 16 + hv;
+      }
+      return code;
+    }
+    // Literal string. Backslash escape bytes were captured as one item.
+    if (textBytes[0] === 0x5C && textBytes.length > 1) {
+      const c = textBytes[1];
+      if (c >= 0x30 && c <= 0x37) {
+        // \ddd octal (1–3 digits)
+        let code = 0;
+        for (let k = 1; k < textBytes.length; k++) {
+          code = code * 8 + (textBytes[k] - 0x30);
+        }
+        return code;
+      }
+      // Single-char escapes
+      if (c === 0x6E) return 10;  // \n
+      if (c === 0x72) return 13;  // \r
+      if (c === 0x74) return 9;   // \t
+      if (c === 0x62) return 8;   // \b
+      if (c === 0x66) return 12;  // \f
+      if (c === 0x28) return 40;  // \(
+      if (c === 0x29) return 41;  // \)
+      if (c === 0x5C) return 92;  // \\
+      return c;
+    }
+    return textBytes[0];
+  }
+
+  // --------------------------------------------------------------------------
+  // Tokenizer + walker for PDF content streams.
+  // Handles the subset of operators required to compute text position and
+  // identify text-showing operators. Latin-1 byte-string encoding is used
+  // throughout because PDF content streams are 8-bit clean and may contain
+  // arbitrary glyph-id bytes inside string operands.
+  // --------------------------------------------------------------------------
+
+  const WHITESPACE = new Set([0x00, 0x09, 0x0A, 0x0C, 0x0D, 0x20]);
+  const DELIM      = new Set([0x28, 0x29, 0x3C, 0x3E, 0x5B, 0x5D, 0x7B, 0x7D, 0x2F, 0x25]);
+
+  function isWS(b)  { return WHITESPACE.has(b); }
+  function isDelim(b) { return DELIM.has(b); }
+
+  function walkAndBlank(bytes, pdfRects, fontInfoMap) {
+    const out = [];      // rebuilt byte sequence (returned as `modified`)
+    let i = 0;
+    let blanked = 0;
+    // The CTM at end-of-stream is also returned so the caller can reset it
+    // before appending its own user-space drawing operators.
+
+    // Operand stack: tokens since the last operator. Each token is
+    // { type, value, outStart, outEnd } where outStart/outEnd are byte
+    // offsets into `out` (so an operand's bytes can be located later for
+    // in-place replacement).
+    let stack = [];
+
+    // Text state. Tm is the current text matrix; Tm[4], Tm[5] hold the
+    // text origin (translation). Tlm is the text line matrix (set by
+    // Tm / Td / TD).
+    let inText = false;
+    let tm  = [1, 0, 0, 1, 0, 0];
+    let tlm = [1, 0, 0, 1, 0, 0];
+    let leading = 0;
+    let fontSize = 12; // default if Tf has not run yet
+    // null = unknown (Tf hasn't run yet, or font not in the map). The
+    // surgical splitter only runs when fontInfo is set; otherwise the
+    // back to whole-operand blank so a CID glyph is never cut in half.
+    let fontInfo = null;
+
+    // Graphics state — Current Transformation Matrix stack (q / Q / cm).
+    // PDFs commonly wrap the entire content in a Y-flipping CTM (e.g. a
+    // top-level `0.24 0 0 -0.24 0 792 cm`), so the walker must track the
+    // CTM to compute each text run's user-space position. Without it, the
+    // rect-intersection check would compare against text-space coords
+    // that do not map to the user-space rects coming from the UI.
+    let ctm = [1, 0, 0, 1, 0, 0];
+    const ctmStack = [];
+
+    while (i < bytes.length) {
+      const start = i;
+      const b = bytes[i];
+
+      // Skip whitespace.
+      if (isWS(b)) { out.push(b); i++; continue; }
+
+      // Comment: % to end of line.
+      if (b === 0x25) {
+        while (i < bytes.length && bytes[i] !== 0x0A && bytes[i] !== 0x0D) {
+          out.push(bytes[i]); i++;
+        }
+        continue;
+      }
+
+      // Literal string: ( ... ) with balanced parens and \ escapes.
+      if (b === 0x28) {
+        const tok = readLiteralString(bytes, i);
+        const outStart = out.length;
+        for (let k = i; k < tok.end; k++) out.push(bytes[k]);
+        stack.push({ type: 'string', outStart, outEnd: out.length });
+        i = tok.end;
+        continue;
+      }
+
+      // Hex string or dict open.
+      if (b === 0x3C) {
+        if (bytes[i + 1] === 0x3C) {
+          const tok = readBalanced(bytes, i, 0x3C, 0x3E, 2);
+          const outStart = out.length;
+          for (let k = i; k < tok.end; k++) out.push(bytes[k]);
+          stack.push({ type: 'dict', outStart, outEnd: out.length });
+          i = tok.end;
+          continue;
+        }
+        // hex string until '>'
+        let j = i + 1;
+        while (j < bytes.length && bytes[j] !== 0x3E) j++;
+        j++; // include '>'
+        const outStart = out.length;
+        for (let k = i; k < j; k++) out.push(bytes[k]);
+        stack.push({ type: 'string', outStart, outEnd: out.length });
+        i = j;
+        continue;
+      }
+
+      // Array.
+      if (b === 0x5B) {
+        const tok = readBalanced(bytes, i, 0x5B, 0x5D, 1);
+        const outStart = out.length;
+        for (let k = i; k < tok.end; k++) out.push(bytes[k]);
+        stack.push({ type: 'array', outStart, outEnd: out.length });
+        i = tok.end;
+        continue;
+      }
+
+      // Name.
+      if (b === 0x2F) {
+        let j = i + 1;
+        while (j < bytes.length && !isWS(bytes[j]) && !isDelim(bytes[j])) j++;
+        const outStart = out.length;
+        for (let k = i; k < j; k++) out.push(bytes[k]);
+        stack.push({ type: 'name', outStart, outEnd: out.length, value: latin1(bytes, i, j) });
+        i = j;
+        continue;
+      }
+
+      // Number or operator. Read until whitespace/delimiter.
+      let j = i + 1;
+      while (j < bytes.length && !isWS(bytes[j]) && !isDelim(bytes[j])) j++;
+      const text = latin1(bytes, i, j);
+
+      if (/^[+-]?(\d+\.?\d*|\.\d+)$/.test(text)) {
+        const outStart = out.length;
+        for (let k = i; k < j; k++) out.push(bytes[k]);
+        stack.push({ type: 'number', outStart, outEnd: out.length, value: parseFloat(text) });
+        i = j;
+        continue;
+      }
+
+      // It's an operator. Apply it, then clear the stack.
+      const op = text;
+
+      if (op === 'q') {
+        ctmStack.push(ctm.slice());
+      } else if (op === 'Q') {
+        ctm = ctmStack.pop() || [1, 0, 0, 1, 0, 0];
+      } else if (op === 'cm') {
+        // cm a b c d e f — concatenate to the CTM. PDF semantics in row-
+        // vector convention: new_CTM = M × CTM_old. multiplyMatrix(a, b)
+        // here returns the composition C such that C(x) = a(b(x)) =
+        // (x × b) × a = x × (b × a), i.e. it produces b × a. So to get
+        // M × CTM_old, call multiplyMatrix(CTM_old, M).
+        const m = numbersAt(stack, 6);
+        if (m) ctm = multiplyMatrix(ctm, m);
+      } else if (op === 'BT') {
+        inText = true;
+        tm  = [1, 0, 0, 1, 0, 0];
+        tlm = [1, 0, 0, 1, 0, 0];
+      } else if (op === 'ET') {
+        inText = false;
+      } else if (op === 'Tf') {
+        // Tf  <font> <size>
+        const size = numberAt(stack, -1);
+        if (size != null) fontSize = size;
+        // Look up the font info (byteWidth + widths). Null = unknown font.
+        const fontTok = stack.at(-2);
+        if (fontTok && fontTok.type === 'name' && fontInfoMap) {
+          const fontName = fontTok.value.startsWith('/') ? fontTok.value.slice(1) : fontTok.value;
+          fontInfo = fontInfoMap.get(fontName) || null;
+        } else {
+          fontInfo = null;
+        }
+      } else if (op === 'TL') {
+        leading = numberAt(stack, -1) ?? leading;
+      } else if (op === 'Tm') {
+        // Tm a b c d e f
+        const v = numbersAt(stack, 6);
+        if (v) { tm = v.slice(); tlm = v.slice(); }
+      } else if (op === 'Td') {
+        const tx = numberAt(stack, -2);
+        const ty = numberAt(stack, -1);
+        if (tx != null && ty != null) {
+          tlm = translateMatrix(tlm, tx, ty);
+          tm  = tlm.slice();
+        }
+      } else if (op === 'TD') {
+        const tx = numberAt(stack, -2);
+        const ty = numberAt(stack, -1);
+        if (tx != null && ty != null) {
+          leading = -ty;
+          tlm = translateMatrix(tlm, tx, ty);
+          tm  = tlm.slice();
+        }
+      } else if (op === 'T*') {
+        tlm = translateMatrix(tlm, 0, -leading);
+        tm  = tlm.slice();
+      } else if (op === 'Tj' || op === "'" || op === '"' || op === 'TJ') {
+        // For ' and " the show op also moves to the next line (T*-like).
+        if (op === "'" || op === '"') {
+          tlm = translateMatrix(tlm, 0, -leading);
+          tm  = tlm.slice();
+        }
+        const operand = pickOperandForShowOp(op, stack);
+        if (operand) {
+          // Origin in user space = CTM × Tm × (0, 0).
+          const tx = tm[4], ty = tm[5];
+          const xUser = ctm[0] * tx + ctm[2] * ty + ctm[4];
+          const yUser = ctm[1] * tx + ctm[3] * ty + ctm[5];
+
+          // Combined X/Y scales from Tm × CTM. The sign indicates which way
+          // the glyph extends from origin in user-space (Y-flip cancels if
+          // both Tm[3] and ctm[3] are negative).
+          const yScale = tm[3] * ctm[3];
+          const xScale = tm[0] * ctm[0];
+          const userHeight = fontSize * Math.abs(yScale);
+          const ySign = yScale >= 0 ? 1 : -1;
+          const xSign = xScale >= 0 ? 1 : -1;
+
+          // For Tj / TJ with a known font, attempt per-glyph surgical
+          // blanking so a rect over the value does not also wipe out a
+          // label sharing the same operand. For unknown fonts, ' and "
+          // ops, or CID + literal strings (rare; the backslash-escape
+          // walker cannot safely group bytes into 2-byte pairs), fall
+          // back to whole-operand blanking — this can over-redact at
+          // operand boundaries but will never produce garbage glyphs.
+          const isHex = out[operand.outStart] === 0x3C;
+          const byteWidth = fontInfo ? fontInfo.byteWidth : 0;
+          const canSurgical = (op === 'Tj' || op === 'TJ')
+            && fontInfo
+            && (isHex || byteWidth === 1);
+
+          if (canSurgical) {
+            const ctxObj = { xUser, yUser, fontSize, xScale, xSign, userHeight, ySign };
+            const status = surgicalBlank(out, operand, op, ctxObj, pdfRects, fontInfo);
+            if (status !== 'none') blanked++;
+          } else {
+            const innerLen = Math.max(0, (operand.outEnd - operand.outStart) - 2);
+            const charBytes = isHex ? Math.ceil(innerLen / 2) : innerLen;
+            const textWidth = charBytes * fontSize * 0.6;
+            const userWidth = textWidth * Math.abs(xScale);
+            if (anyRectIntersectsRun(pdfRects, xUser, yUser, userWidth, userHeight, xSign, ySign)) {
+              blankInOutput(out, operand);
+              blanked++;
+            }
+          }
+        }
+      }
+
+      // Push the operator bytes themselves.
+      for (let k = i; k < j; k++) out.push(bytes[k]);
+      stack = [];
+      i = j;
+    }
+
+    return { modified: new Uint8Array(out), blanked, finalCtm: ctm };
+  }
+
+  function pickOperandForShowOp(op, stack) {
+    // Tj / ' :  string is last operand.
+    // " :        aw ac string  -> string is last.
+    // TJ :       array is last.
+    if (stack.length === 0) return null;
+    const top = stack[stack.length - 1];
+    if ((op === 'Tj' || op === "'" || op === '"') && top.type === 'string') return top;
+    if (op === 'TJ' && top.type === 'array') return top;
+    return null;
+  }
+
+  function blankInOutput(out, operand) {
+    // Replace operand bytes in `out` with an empty equivalent ("()" for
+    // strings, "[]" for TJ arrays). Length differences are fine — PDF
+    // parsers tolerate any operand length. The operand's outStart/outEnd
+    // were recorded at token-push time, so this stays correct as earlier
+    // splices shift later byte offsets.
+    const len = operand.outEnd - operand.outStart;
+    const replacement = operand.type === 'array'
+      ? [0x5B, 0x5D]   // []
+      : [0x28, 0x29];  // ()
+    out.splice(operand.outStart, len, ...replacement);
+  }
+
+  // --------------------------------------------------------------------------
+  // Surgical (per-glyph) blanking for Tj / TJ. blankInOutput drops the whole
+  // text-show op when the rect grazes any of its glyphs, which on PDFs that
+  // pack a label and a value into one operand (a single TJ array containing
+  // "Invoice # 12345") would wipe the label too. surgicalBlank walks every
+  // glyph using the font's byte-width (1 for simple fonts, 2 for CID/Type0)
+  // and per-glyph widths, marks only those whose own bbox falls inside the
+  // rect, and rebuilds the operand keeping the rest.
+  // --------------------------------------------------------------------------
+  function surgicalBlank(out, operand, op, ctx, pdfRects, fontInfo) {
+    // Y-band of the whole operand.
+    const dy = ctx.ySign * ctx.userHeight;
+    const yLo = Math.min(ctx.yUser, ctx.yUser + dy);
+    const yHi = Math.max(ctx.yUser, ctx.yUser + dy);
+
+    // Filter to rects whose Y-band overlaps this run's Y-band (a single
+    // line shares Y, so this is enough to limit per-glyph X checks below).
+    const yRects = [];
+    for (const r of pdfRects) {
+      if (yHi < r.y || yLo > r.y + r.h) continue;
+      yRects.push(r);
+    }
+    if (yRects.length === 0) return 'none';
+
+    const items = (op === 'TJ')
+      ? parseTJItems(out, operand, fontInfo.byteWidth)
+      : parseStringChars(out, operand, fontInfo.byteWidth);
+
+    let xCursor = ctx.xUser;
+    let allBlanked = true;
+    let anyBlanked = false;
+    let charCount = 0;
+    for (const it of items) {
+      if (it.kind === 'char') {
+        charCount++;
+        // Per-glyph width from /Widths or /W (in 1/1000 em units).
+        const code = getGlyphCharCode(it.textBytes, it.isHex);
+        const widthUnits = lookupGlyphWidth(fontInfo, code);
+        const advTextSpace = widthUnits * ctx.fontSize / 1000;
+        const advUserSpace = advTextSpace * Math.abs(ctx.xScale);
+        const xLo = Math.min(xCursor, xCursor + ctx.xSign * advUserSpace);
+        const xHi = Math.max(xCursor, xCursor + ctx.xSign * advUserSpace);
+        it.advTextSpace = advTextSpace;
+        it.widthUnits = widthUnits;
+        // Require >50% of the glyph's width to be inside the rect so a
+        // boundary glyph isn't accidentally swept up with the redaction.
+        it.blanked = yRects.some(r => {
+          const overlap = Math.min(xHi, r.x + r.w) - Math.max(xLo, r.x);
+          return overlap > 0 && overlap > (xHi - xLo) * 0.5;
+        });
+        if (it.blanked) anyBlanked = true; else allBlanked = false;
+        xCursor += ctx.xSign * advUserSpace;
+      } else if (it.kind === 'kern') {
+        // TJ kerning (1/1000 em). Positive shifts left; negative right.
+        const advTextSpace = -it.value * ctx.fontSize / 1000;
+        const advUserSpace = advTextSpace * Math.abs(ctx.xScale);
+        xCursor += ctx.xSign * advUserSpace;
+      }
+    }
+
+    if (charCount === 0 || !anyBlanked) return 'none';
+    if (allBlanked) {
+      blankInOutput(out, operand);
+      return 'all';
+    }
+
+    const newBytes = (op === 'TJ')
+      ? rebuildTJArray(items, ctx.fontSize)
+      : rebuildTjAsMultiOp(items, ctx.fontSize);
+
+    const len = operand.outEnd - operand.outStart;
+    out.splice(operand.outStart, len, ...newBytes);
+    return 'partial';
+  }
+
+  function parseStringChars(out, operand, byteWidth) {
+    // Returns an array of { kind: 'char', textBytes, isHex } items, one per
+    // glyph. byteWidth = 1 (simple fonts) or 2 (CID/Type0). For hex strings,
+    // each glyph occupies byteWidth*2 hex chars; for literals, byteWidth=1
+    // means each byte is a glyph (the only safe case the caller routes to
+    // this fn for literals — CID + literal is sent to whole-blank instead).
+    const items = [];
+    const isHex = out[operand.outStart] === 0x3C;
+
+    if (isHex) {
+      const hexPerGlyph = byteWidth * 2;
+      let i = operand.outStart + 1;
+      const end = operand.outEnd - 1;
+      let buf = [];
+      while (i < end) {
+        const b = out[i++];
+        if (isWS(b)) continue;
+        buf.push(b);
+        if (buf.length === hexPerGlyph) {
+          items.push({ kind: 'char', textBytes: new Uint8Array(buf), isHex: true });
+          buf = [];
+        }
+      }
+      if (buf.length > 0) {
+        items.push({ kind: 'char', textBytes: new Uint8Array(buf), isHex: true });
+      }
+    } else {
+      // Literal string. byteWidth is 1 here (CID + literal is routed to
+      // whole-blank by the caller, since backslash-escape boundaries do
+      // not align with 2-byte glyph pairs).
+      let i = operand.outStart + 1;
+      const end = operand.outEnd - 1;
+      while (i < end) {
+        const b = out[i];
+        if (b === 0x5C) {
+          // Backslash escape (\n \r \t \b \f \( \) \\ \ddd) — 1 glyph.
+          let escEnd = i + 2;
+          const next = out[i + 1];
+          if (next >= 0x30 && next <= 0x37) {
+            escEnd = i + 1;
+            while (escEnd < end && escEnd < i + 4 && out[escEnd] >= 0x30 && out[escEnd] <= 0x37) escEnd++;
+          }
+          const buf = [];
+          for (let k = i; k < escEnd; k++) buf.push(out[k]);
+          items.push({ kind: 'char', textBytes: new Uint8Array(buf), isHex: false });
+          i = escEnd;
+        } else {
+          items.push({ kind: 'char', textBytes: new Uint8Array([b]), isHex: false });
+          i++;
+        }
+      }
+    }
+    return items;
+  }
+
+  function parseTJItems(out, operand, byteWidth) {
+    // Walks a TJ array. Strings are flattened into char items so the same
+    // walker can position them; numbers become kern items (cursor offsets).
+    const items = [];
+    let i = operand.outStart + 1;
+    const end = operand.outEnd - 1;
+    while (i < end) {
+      if (isWS(out[i])) { i++; continue; }
+      const b = out[i];
+      if (b === 0x28) {
+        const tok = readLiteralString(out, i);
+        // CID + literal is unsafe (escape boundaries don't align with
+        // 2-byte glyph pairs); the caller routes such operands to
+        // whole-blank, so this branch only runs for byteWidth=1 literals
+        // (or hex strings, handled below).
+        items.push(...parseStringChars(out, { outStart: i, outEnd: tok.end }, byteWidth));
+        i = tok.end;
+      } else if (b === 0x3C) {
+        let j = i + 1;
+        while (j < end && out[j] !== 0x3E) j++;
+        j++;
+        items.push(...parseStringChars(out, { outStart: i, outEnd: j }, byteWidth));
+        i = j;
+      } else {
+        let j = i;
+        while (j < end && !isWS(out[j])) j++;
+        const text = latin1(out, i, j);
+        if (/^[+-]?(\d+\.?\d*|\.\d+)$/.test(text)) {
+          items.push({ kind: 'kern', value: parseFloat(text) });
+        }
+        i = j;
+      }
+    }
+    return items;
+  }
+
+  function rebuildTJArray(items, fontSize) {
+    // Reconstructs a TJ array. Kept chars accumulate into string elements;
+    // blanked chars become kerning numbers preserving the cursor advance;
+    // original kerns are passed through.
+    const bytes = [0x5B, 0x20]; // [
+    let curStr = null; // { isHex, bytes }
+
+    function flushStr() {
+      if (!curStr || curStr.bytes.length === 0) { curStr = null; return; }
+      bytes.push(curStr.isHex ? 0x3C : 0x28);
+      for (const b of curStr.bytes) bytes.push(b);
+      bytes.push(curStr.isHex ? 0x3E : 0x29);
+      bytes.push(0x20);
+      curStr = null;
+    }
+    function pushAscii(s) { for (let k = 0; k < s.length; k++) bytes.push(s.charCodeAt(k)); }
+
+    for (const it of items) {
+      if (it.kind === 'char') {
+        if (it.blanked) {
+          flushStr();
+          // kern = -1000 × advTextSpace / fontSize. Our 0.6 approx → ~-600.
+          const kern = -1000 * it.advTextSpace / fontSize;
+          pushAscii(kern.toFixed(0) + ' ');
+        } else {
+          if (!curStr || curStr.isHex !== it.isHex) {
+            flushStr();
+            curStr = { isHex: it.isHex, bytes: [] };
+          }
+          for (const b of it.textBytes) curStr.bytes.push(b);
+        }
+      } else if (it.kind === 'kern') {
+        flushStr();
+        pushAscii(it.value + ' ');
+      }
+    }
+    flushStr();
+    bytes.push(0x5D);
+    return new Uint8Array(bytes);
+  }
+
+  function rebuildTjAsMultiOp(items, fontSize) {
+    // Replaces a Tj operand with a sequence of ops:
+    //   `(kept) Tj [ -kern ] TJ (kept) Tj ... (kept)`
+    // The trailing `(kept)` is left open for the Tj operator that the
+    // walker emits next, which closes it as `(kept) Tj`. Blanked glyphs
+    // become a 1-element TJ kern array so the cursor advances without
+    // rendering anything.
+    const segments = [];
+    let cur = null;
+    for (const it of items) {
+      if (it.kind !== 'char') continue;
+      const status = it.blanked ? 'blank' : 'keep';
+      if (cur && cur.status === status) cur.items.push(it);
+      else { if (cur) segments.push(cur); cur = { status, items: [it] }; }
+    }
+    if (cur) segments.push(cur);
+    if (segments.length === 0) return new Uint8Array([0x28, 0x29]);
+
+    const bytes = [];
+    function pushAscii(s) { for (let k = 0; k < s.length; k++) bytes.push(s.charCodeAt(k)); }
+    function emitString(its) {
+      const isHex = its[0].isHex;
+      bytes.push(isHex ? 0x3C : 0x28);
+      for (const it of its) for (const b of it.textBytes) bytes.push(b);
+      bytes.push(isHex ? 0x3E : 0x29);
+    }
+    function emitKernTJ(its) {
+      const totalAdv = its.reduce((s, it) => s + it.advTextSpace, 0);
+      const kern = -1000 * totalAdv / fontSize;
+      pushAscii(`[ ${kern.toFixed(0)} ] TJ `);
+    }
+
+    for (let i = 0; i < segments.length - 1; i++) {
+      const seg = segments[i];
+      if (seg.status === 'keep') { emitString(seg.items); pushAscii(' Tj '); }
+      else { emitKernTJ(seg.items); }
+    }
+    const last = segments[segments.length - 1];
+    if (last.status === 'keep') {
+      emitString(last.items);              // natural ` Tj` will close this
+    } else {
+      emitKernTJ(last.items);
+      bytes.push(0x28, 0x29);              // empty () for natural ` Tj`
+    }
+    return new Uint8Array(bytes);
+  }
+
+
+  function readLiteralString(bytes, start) {
+    let j = start + 1;
+    let depth = 1;
+    while (j < bytes.length && depth > 0) {
+      const b = bytes[j];
+      if (b === 0x5C) { j += 2; continue; } // backslash escape
+      if (b === 0x28) depth++;
+      else if (b === 0x29) depth--;
+      j++;
+    }
+    return { end: j };
+  }
+
+  function readBalanced(bytes, start, openByte, closeByte, openLen) {
+    let j = start + openLen;
+    let depth = 1;
+    while (j < bytes.length && depth > 0) {
+      if (bytes[j] === 0x5C) { j += 2; continue; }
+      if (openLen === 2) {
+        if (bytes[j] === 0x3C && bytes[j+1] === 0x3C) { depth++; j += 2; continue; }
+        if (bytes[j] === 0x3E && bytes[j+1] === 0x3E) { depth--; j += 2; continue; }
+      } else {
+        if (bytes[j] === openByte)  depth++;
+        if (bytes[j] === closeByte) depth--;
+      }
+      j++;
+    }
+    return { end: j };
+  }
+
+  function latin1(bytes, start, end) {
+    let s = '';
+    for (let i = start; i < end; i++) s += String.fromCharCode(bytes[i]);
+    return s;
+  }
+
+  function numberAt(stack, idx) {
+    const t = stack.at(idx);
+    return t && t.type === 'number' ? t.value : null;
+  }
+
+  function numbersAt(stack, n) {
+    if (stack.length < n) return null;
+    const slice = stack.slice(-n);
+    if (!slice.every(t => t.type === 'number')) return null;
+    return slice.map(t => t.value);
+  }
+
+  function translateMatrix(m, tx, ty) {
+    return [
+      m[0], m[1], m[2], m[3],
+      tx * m[0] + ty * m[2] + m[4],
+      tx * m[1] + ty * m[3] + m[5],
+    ];
+  }
+
+  // Per-character span rendering. Each char gets its own absolutely-
+  // positioned span with scaleX applied uniformly so the visual sum
+  // matches the PDF item's reported width. Per-char selection rectangles
+  // hug each glyph individually instead of being averaged across one
+  // long span — should reduce visible mis-coverage on items where the
+  // canvas font's per-glyph widths differ a lot from the system fallback.
+  async function renderTextLayer(page, viewport, container) {
+    container.innerHTML = '';
+    const tc = await page.getTextContent();
+    const styles = tc.styles || {};
+    const frag = document.createDocumentFragment();
+    const xScale = Math.abs(viewport.transform[0]);
+
+    // Hidden canvas for measuring natural glyph widths in the same font
+    // as the spans. measureText() returns sub-pixel float widths.
+    const measureCanvas = document.createElement('canvas');
+    const measureCtx = measureCanvas.getContext('2d');
+
+    for (const item of tc.items) {
+      if (!item.str) continue;
+      const tx = multiplyMatrix(viewport.transform, item.transform);
+      const fontHeight = Math.hypot(tx[2], tx[3]);
+      if (fontHeight < 1) continue;
+      const angle = Math.atan2(tx[1], tx[0]);
+
+      const style = styles[item.fontName];
+      const family = style && style.fontFamily ? `${style.fontFamily}, sans-serif` : 'sans-serif';
+
+      // Measure natural width of full string + each character.
+      measureCtx.font = `${fontHeight}px ${family}`;
+      const fullNatW = measureCtx.measureText(item.str).width;
+      const targetW = (item.width || 0) * xScale;
+      const widthScale = (fullNatW > 0 && targetW > 0) ? targetW / fullNatW : 1;
+
+      const rot = Math.abs(angle) > 0.01 ? `rotate(${angle}rad) ` : '';
+      const top = tx[5] - fontHeight;
+      let cumulativeX = 0;
+
+      for (const ch of item.str) {
+        const naturalW = measureCtx.measureText(ch).width;
+        const span = document.createElement('span');
+        span.textContent = ch;
+        span.style.left = `${tx[4] + cumulativeX}px`;
+        span.style.top  = `${top}px`;
+        span.style.fontSize = `${fontHeight}px`;
+        span.style.fontFamily = family;
+        if (Math.abs(widthScale - 1) > 0.001 || rot) {
+          span.style.transform = `${rot}scaleX(${widthScale})`;
+          span.style.transformOrigin = '0 0';
+        }
+        frag.appendChild(span);
+        cumulativeX += naturalW * widthScale;
+      }
+    }
+
+    container.appendChild(frag);
+  }
+
+  // Compose two PDF affine matrices: result(p) = m1(m2(p)), i.e. m2 applied
+  // first to a local point, then m1. Used for accumulating cm operators
+  // into the running CTM.
+  function multiplyMatrix(m1, m2) {
+    return [
+      m1[0]*m2[0] + m1[2]*m2[1],
+      m1[1]*m2[0] + m1[3]*m2[1],
+      m1[0]*m2[2] + m1[2]*m2[3],
+      m1[1]*m2[2] + m1[3]*m2[3],
+      m1[0]*m2[4] + m1[2]*m2[5] + m1[4],
+      m1[1]*m2[4] + m1[3]*m2[5] + m1[5],
+    ];
+  }
+
+  // Invert a PDF affine matrix [a b c d e f]. Used to "undo" the active
+  // CTM at end-of-stream so the rectangle drawing operators that get
+  // appended afterwards are interpreted in user-space coordinates rather
+  // than in whatever transformed local space the stream ended in.
+  function invertMatrix(m) {
+    const det = m[0] * m[3] - m[1] * m[2];
+    if (Math.abs(det) < 1e-10) return [1, 0, 0, 1, 0, 0]; // singular → fallback
+    return [
+       m[3] / det,
+      -m[1] / det,
+      -m[2] / det,
+       m[0] / det,
+      (m[2] * m[5] - m[3] * m[4]) / det,
+      (m[1] * m[4] - m[0] * m[5]) / det,
+    ];
+  }
+
+  function anyRectIntersectsRun(rects, x, y, width, height, xSign, ySign) {
+    // Bbox intersection in user space. The text origin (x, y) extends by
+    // (xSign × width, ySign × height); direction comes from the combined
+    // signs of Tm and CTM (a Y-flipped Tm under a Y-flipped CTM means
+    // text extends upward in user space rather than downward).
+    const dy = ySign * height;
+    const dx = xSign * width;
+    const yLo = Math.min(y, y + dy);
+    const yHi = Math.max(y, y + dy);
+    const xLo = Math.min(x, x + dx);
+    const xHi = Math.max(x, x + dx);
+    for (const r of rects) {
+      if (yHi < r.y || yLo > r.y + r.h) continue;
+      if (xHi < r.x || xLo > r.x + r.w) continue;
+      return true;
+    }
+    return false;
+  }
+
+  // --------------------------------------------------------------------------
+  // Verification: re-extract text from the saved PDF, count any text items
+  // whose position still falls inside a redaction rect on its page.
+  // --------------------------------------------------------------------------
+  async function verifyRedaction(outBytes) {
+    let leakedItems = 0;
+    const verifyDoc = await pdfjs.getDocument({ data: outBytes.slice(0) }).promise;
+    for (const p of state.pages) {
+      if (p.rects.length === 0) continue;
+      const vp = await verifyDoc.getPage(p.pageNum);
+      const viewport = vp.getViewport({ scale: 1 });
+      const tc = await vp.getTextContent();
+      const pdfRects = p.rects.map(r => ({
+        x: r.x / p.scale,
+        y: viewport.height - (r.y + r.h) / p.scale,
+        w: r.w / p.scale,
+        h: r.h / p.scale,
+      }));
+      for (const item of tc.items) {
+        const x = item.transform[4];
+        const y = item.transform[5];
+        const h = item.height || Math.abs(item.transform[3]) || 12;
+        const w = item.width || 0;
+        if (anyRectIntersectsRun(pdfRects, x, y, h, w)) {
+          if ((item.str || '').trim().length > 0) leakedItems++;
+        }
+      }
+    }
+    return { leakedItems };
+  }
+
+  // ---- mobile gesture hint --------------------------------------------------
+  // Show a one-time dismissible banner the first time a touch-device user
+  // opens a PDF, explaining that double-tap-and-drag is required to draw
+  // redactions (single-drag scrolls).
+  function maybeShowMobileHint() {
+    if (localStorage.getItem('xj-redactor-touch-hint')) return;
+    const isCoarse = matchMedia('(pointer: coarse)').matches;
+    if (!isCoarse) return;
+
+    const hint = document.createElement('div');
+    hint.className = 'mobile-hint';
+    hint.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="10"/>
+        <line x1="12" y1="16" x2="12" y2="12"/>
+        <circle cx="12" cy="8" r="0.5"/>
+      </svg>
+      <span><strong>On mobile:</strong> double-tap and drag on a page to draw a redaction. A single drag scrolls.</span>
+      <button class="mobile-hint__close" type="button" aria-label="Dismiss">&times;</button>
+    `;
+    const container = document.querySelector('.workspace .container');
+    container.insertBefore(hint, container.firstChild);
+
+    function dismiss() {
+      hint.style.opacity = '0';
+      setTimeout(() => hint.remove(), 350);
+      localStorage.setItem('xj-redactor-touch-hint', '1');
+    }
+    hint.querySelector('.mobile-hint__close').addEventListener('click', dismiss);
+    setTimeout(dismiss, 9000);
+  }
+
+  // ---- result banner --------------------------------------------------------
+  // Sits BELOW the sticky ctrl-bar (toolbar + pending bar) in document flow,
+  // so it doesn't break up the two-sticky-bar visual block. Auto-dismisses
+  // after a few seconds so transient feedback like "Dismissed 11" or
+  // "Accepted 9" doesn't linger on screen forever.
+  let resultDismissTimer = null;
+  function showResult(msg, kind) {
+    let $r = document.getElementById('resultBanner');
+    if (!$r) {
+      $r = document.createElement('div');
+      $r.id = 'resultBanner';
+      $r.className = 'result';
+      const ctrlBar = document.querySelector('.ctrl-bar');
+      if (ctrlBar) {
+        ctrlBar.parentNode.insertBefore($r, ctrlBar.nextSibling);
+      }
+    }
+    clearTimeout(resultDismissTimer);
+    if (kind === 'clear' || !msg) {
+      $r.style.opacity = '0';
+      resultDismissTimer = setTimeout(() => { $r.style.display = 'none'; }, 350);
+      return;
+    }
+    $r.style.display = 'flex';
+    $r.style.opacity = '1';
+    $r.dataset.kind = kind;
+    $r.textContent = msg;
+
+    // Auto-dismiss timing: short for success, longer for warn/err.
+    const ms = kind === 'err' ? 9000 : kind === 'warn' ? 6000 : 4000;
+    resultDismissTimer = setTimeout(() => {
+      $r.style.opacity = '0';
+      resultDismissTimer = setTimeout(() => { $r.style.display = 'none'; }, 350);
+    }, ms);
+  }
+
+  // ---- file load ------------------------------------------------------------
+  async function loadFile(file) {
+    state.fileName = file.name;
+    state.fileBytes = await file.arrayBuffer();
+
+    // pdfjs needs a fresh copy because it transfers ownership
+    const loadingTask = pdfjs.getDocument({ data: state.fileBytes.slice(0) });
+    state.pdfDoc = await loadingTask.promise;
+
+    // tear down any previous render
+    $pages.innerHTML = '';
+    state.pages = [];
+
+    // Activate workspace BEFORE measuring container width — otherwise the
+    // pages container is inside a `display: none` section and
+    // getBoundingClientRect returns 0, falling back to 900px which is
+    // way too wide for mobile viewports (overflows half the screen).
+    $workspace.dataset.active = 'true';
+    $exportBtn.disabled = false;
+    $clearBtn.disabled = false;
+    setAutoEnabled(true);
+
+    // Now the container has real dimensions; pick a width that fits.
+    const fallbackWidth = Math.max(320, window.innerWidth - 32);
+    const measured = $pages.getBoundingClientRect().width || fallbackWidth;
+    state.baseWidth = Math.min(900, measured);
+    state.zoom = 1;
+    $zoomLevel.textContent = '100%';
+    $zoomOutBtn.disabled = false;
+    $zoomInBtn.disabled = false;
+    $zoomLevelBtn.disabled = false;
+
+    for (let i = 1; i <= state.pdfDoc.numPages; i++) {
+      await renderPage(i, state.baseWidth);
+    }
+
+    maybeShowMobileHint();
+    updateCount();
+
+    // scroll to first page
+    $workspace.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  async function renderPage(pageNum, targetWidth) {
+    const page = await state.pdfDoc.getPage(pageNum);
+
+    // compute scale so rendered width matches targetWidth
+    const rawViewport = page.getViewport({ scale: 1 });
+    const scale = targetWidth / rawViewport.width;
+    const viewport = page.getViewport({ scale });
+
+    // page wrapper
+    const root = document.createElement('div');
+    root.className = 'page';
+    root.style.width = `${viewport.width}px`;
+    root.style.height = `${viewport.height}px`;
+
+    const label = document.createElement('span');
+    label.className = 'page__label';
+    label.textContent = `page ${pageNum} / ${state.pdfDoc.numPages}`;
+    root.appendChild(label);
+
+    const canvas = document.createElement('canvas');
+    canvas.className = 'page__canvas';
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.floor(viewport.width * dpr);
+    canvas.height = Math.floor(viewport.height * dpr);
+    canvas.style.width = `${viewport.width}px`;
+    canvas.style.height = `${viewport.height}px`;
+    root.appendChild(canvas);
+
+    // Selectable transparent text layer (used in "Select" cursor mode).
+    const textLayer = document.createElement('div');
+    textLayer.className = 'page__textLayer';
+    root.appendChild(textLayer);
+
+    const overlay = document.createElement('div');
+    overlay.className = 'page__overlay';
+    root.appendChild(overlay);
+
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    await renderTextLayer(page, viewport, textLayer);
+
+    // Wrap in a horizontally scrollable frame so a zoomed page (wider than
+    // the viewport) can be panned sideways without breaking page layout.
+    const frame = document.createElement('div');
+    frame.className = 'page-frame';
+    frame.appendChild(root);
+    $pages.appendChild(frame);
+
+    const pageState = {
+      pageNum,
+      page,
+      viewport,
+      scale,
+      canvas,
+      overlay,
+      textLayer,
+      root,
+      frame,
+      rects: [],          // each rect in viewport pixel space; converted to PDF user space at export
+    };
+    wireOverlay(pageState);
+    state.pages.push(pageState);
+  }
+
+  // ---- rectangle drawing ----------------------------------------------------
+  // Mouse: click-and-drag draws a rect immediately.
+  // Touch/pen: a *double-tap* arms drawing for that gesture; the first tap
+  // (or any single drag) lets the browser scroll the page natively. This way
+  // users can navigate a long PDF without accidentally creating redactions.
+  function wireOverlay(p) {
+    let drafting = null;
+    let draftEl = null;
+    let lastTapTime = 0;
+    let lastTapX = 0;
+    let lastTapY = 0;
+    const DOUBLE_TAP_MS = 350;
+    const DOUBLE_TAP_TOL = 30; // px
+
+    function startDraft(localX, localY) {
+      drafting = { x: localX, y: localY };
+      draftEl = document.createElement('div');
+      draftEl.className = 'draft-rect';
+      draftEl.style.left = `${localX}px`;
+      draftEl.style.top  = `${localY}px`;
+      draftEl.style.width  = '0px';
+      draftEl.style.height = '0px';
+      p.overlay.appendChild(draftEl);
+    }
+
+    p.overlay.addEventListener('pointerdown', (e) => {
+      if (e.target !== p.overlay) return;
+      const rect = p.overlay.getBoundingClientRect();
+      const localX = e.clientX - rect.left;
+      const localY = e.clientY - rect.top;
+
+      if (e.pointerType === 'mouse') {
+        e.preventDefault();
+        try { p.overlay.setPointerCapture(e.pointerId); } catch {}
+        startDraft(localX, localY);
+        return;
+      }
+
+      // Touch / pen: double-tap arms drawing.
+      const now = Date.now();
+      const dx = e.clientX - lastTapX;
+      const dy = e.clientY - lastTapY;
+      const isDoubleTap = (now - lastTapTime < DOUBLE_TAP_MS)
+        && Math.abs(dx) < DOUBLE_TAP_TOL
+        && Math.abs(dy) < DOUBLE_TAP_TOL;
+
+      if (isDoubleTap) {
+        e.preventDefault();
+        try { p.overlay.setPointerCapture(e.pointerId); } catch {}
+        startDraft(localX, localY);
+        if (navigator.vibrate) navigator.vibrate(15);
+        lastTapTime = 0;
+      } else {
+        // Just a single tap; record it and let the browser scroll/handle.
+        lastTapTime = now;
+        lastTapX = e.clientX;
+        lastTapY = e.clientY;
+      }
+    });
+
+    p.overlay.addEventListener('pointermove', (e) => {
+      if (!drafting || !draftEl) return;
+      const rect = p.overlay.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      const x = Math.min(drafting.x, cx);
+      const y = Math.min(drafting.y, cy);
+      const w = Math.abs(cx - drafting.x);
+      const h = Math.abs(cy - drafting.y);
+      draftEl.style.left = `${x}px`;
+      draftEl.style.top  = `${y}px`;
+      draftEl.style.width  = `${w}px`;
+      draftEl.style.height = `${h}px`;
+    });
+
+    p.overlay.addEventListener('pointerup', (e) => {
+      if (!drafting || !draftEl) return;
+      const rect = p.overlay.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      const x = Math.min(drafting.x, cx);
+      const y = Math.min(drafting.y, cy);
+      const w = Math.abs(cx - drafting.x);
+      const h = Math.abs(cy - drafting.y);
+      draftEl.remove();
+      drafting = null;
+      draftEl = null;
+      if (w < 4 || h < 4) return;
+      p.rects.push({ id: state.nextRectId++, x, y, w, h, pending: false });
+      renderRects(p);
+      updateCount();
+    });
+
+    p.overlay.addEventListener('pointercancel', () => {
+      if (draftEl) draftEl.remove();
+      drafting = null;
+      draftEl = null;
+    });
+  }
+
+  function renderRects(p) {
+    p.overlay.querySelectorAll('.rect').forEach(el => el.remove());
+    p.rects.forEach(r => {
+      // Pending rects whose kind has been toggled off are kept in state but
+      // not painted, so re-enabling the chip restores them.
+      if (r.pending && r.kind && state.disabledKinds.has(r.kind)) return;
+      const el = document.createElement('div');
+      el.className = 'rect';
+      el.style.left = `${r.x}px`;
+      el.style.top  = `${r.y}px`;
+      el.style.width  = `${r.w}px`;
+      el.style.height = `${r.h}px`;
+      if (r.pending) {
+        el.dataset.pending = 'true';
+        if (r.kind) {
+          const kindLabel = document.createElement('span');
+          kindLabel.className = 'rect__kind';
+          kindLabel.textContent = getKindLabel(r.kind);
+          el.appendChild(kindLabel);
+        }
+        // Body click on a pending rect = accept it.
+        el.addEventListener('click', (e) => {
+          if (e.target.closest('.rect__del')) return;
+          r.pending = false;
+          delete r.kind;
+          renderRects(p);
+          updateCount();
+        });
+      }
+      const del = document.createElement('button');
+      del.className = 'rect__del';
+      del.type = 'button';
+      del.textContent = '×';
+      del.setAttribute('aria-label', 'Remove redaction');
+      del.addEventListener('click', (e) => {
+        e.stopPropagation();
+        p.rects = p.rects.filter(x => x.id !== r.id);
+        renderRects(p);
+        updateCount();
+      });
+      el.appendChild(del);
+      p.overlay.appendChild(el);
+    });
+  }
+
+  function updateCount() {
+    let committed = 0, visiblePending = 0, totalPending = 0;
+    for (const p of state.pages) {
+      for (const r of p.rects) {
+        if (r.pending) {
+          totalPending++;
+          if (isKindVisible(r.kind)) visiblePending++;
+        } else {
+          committed++;
+        }
+      }
+    }
+    // Clear is only meaningful when there's something to clear.
+    $clearBtn.disabled = (committed + totalPending) === 0;
+    // Re-enable auto-detect once every proposal has been accepted or
+    // dismissed; running it again with stale proposals on screen would
+    // double-up suggestions.
+    if (totalPending === 0) setAutoEnabled(true);
+    if (committed === 0) {
+      $rectCount.hidden = true;
+    } else {
+      $rectCount.hidden = false;
+      $rectCount.textContent = `${committed} redaction${committed === 1 ? '' : 's'}`;
+    }
+    if (totalPending === 0) {
+      $pendingBar.hidden = true;
+    } else {
+      $pendingBar.hidden = false;
+      // The title only shows the total. Per-type counts on the chips
+      // below already convey what's visible vs filtered out.
+      $pendingCount.textContent = String(totalPending);
+      refreshKindChips();
+    }
+  }
+
+  // Resolve a chip kind to its display label. Built-in kinds use
+  // PII_LABELS; user-defined patterns use their saved name.
+  function getKindLabel(kind) {
+    if (PII_LABELS[kind]) return PII_LABELS[kind];
+    if (kind.startsWith('cust-')) {
+      const id = kind.slice('cust-'.length);
+      const cp = state.customPatterns.find(p => p.id === id);
+      return cp?.name || 'custom';
+    }
+    return kind;
+  }
+
+  function refreshKindChips() {
+    // Count pending rects per kind. Chip persists as long as at least one
+    // pending rect of that kind exists.
+    const counts = {};
+    for (const p of state.pages) {
+      for (const r of p.rects) {
+        if (r.pending && r.kind) {
+          counts[r.kind] = (counts[r.kind] || 0) + 1;
+        }
+      }
+    }
+    $kindChips.innerHTML = '';
+    // Built-in kinds first (in PII_LABELS order), custom kinds after.
+    const orderedKinds = [
+      ...Object.keys(PII_LABELS).filter(k => counts[k]),
+      ...Object.keys(counts).filter(k => k.startsWith('cust-')),
+    ];
+    for (const kind of orderedKinds) {
+      const count = counts[kind];
+      const chip = document.createElement('button');
+      chip.className = 'kind-chip';
+      chip.type = 'button';
+      chip.dataset.kind = kind;
+      chip.dataset.on = state.disabledKinds.has(kind) ? 'false' : 'true';
+      chip.setAttribute('aria-pressed', String(chip.dataset.on === 'true'));
+      const name = document.createElement('span');
+      name.className = 'kind-chip__name';
+      name.textContent = getKindLabel(kind);
+      const num = document.createElement('span');
+      num.className = 'kind-chip__num';
+      num.textContent = String(count);
+      chip.appendChild(name);
+      chip.appendChild(num);
+      chip.addEventListener('click', () => {
+        if (state.disabledKinds.has(kind)) state.disabledKinds.delete(kind);
+        else state.disabledKinds.add(kind);
+        state.pages.forEach(p => renderRects(p));
+        updateCount();
+      });
+      $kindChips.appendChild(chip);
+    }
+  }
+
+  // ---- auto-detect (regex sweep over PDF.js text content) ------------------
+  //
+  // PDF.js fragments text into per-run items, so a phone like "(415) 555-1234"
+  // is often split across 3-5 separate items. Per-item regex misses these.
+  // We instead group items by visual line, build a joined string with
+  // gap-aware spacing, run all patterns on the joined line, then map matches
+  // back to the items they span and union those item bboxes into a proposal
+  // rect. This catches cross-item patterns at the cost of slightly broader
+  // proposal rectangles.
+  // --------------------------------------------------------------------------
+  const PII_LABELS = {
+    custom: 'custom',
+    email: 'email', url: 'url',
+    phone: 'phone', ssn: 'ssn', ein: 'tax-id', cc: 'card', id: 'id',
+    money: 'amount', address: 'address', zip: 'zip',
+  };
+  const PII_PATTERNS = [
+    { kind: 'email',   re: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g },
+    { kind: 'url',     re: /(?:https?:\/\/|www\.)[^\s<>"'()\[\]]+/gi },
+    // Phone: optional country code + area (paren or bare) + 3 + 4 digits
+    // with any of space/dot/dash separators. Negative lookbehind/ahead
+    // keeps the regex off larger digit sequences (invoice numbers, SKUs).
+    // Phone: optional country-code prefix that's either "+" + 1-3 digits OR a
+    // bare "1" (the common NA convention). Separator after country code is
+    // {0,3} so "+18005551234", "+1 800-555-1234", and "1-800-555-1234" all
+    // match. Separator class includes the Unicode dash variants (hyphen,
+    // non-breaking hyphen, en-dash, em-dash, minus) plus NUL (\u0000) which
+    // is what PDF.js extracts when a PDF's font ToUnicode map sends the
+    // dash glyph to byte 0x00.
+    { kind: 'phone',   re: /(?<!\d)(?:(?:\+\d{1,3}|1)[\s.()\-‐-―−\u0000]{0,3})?\(?\d{3}\)?[\s.\-‐-―−\u0000]?\d{3}[\s.\-‐-―−\u0000]?\d{4}(?!\d)/g },
+    // Vanity phones: 1-833-DRAW-365, 1-800-FLOWERS, +1 800 GO-FEDEX.
+    // Allows 3-7 alphanumeric chars in the prefix/line slots, but requires
+    // a country-code prefix to avoid matching arbitrary "ABC-DEF" text.
+    { kind: 'phone',   re: /(?<!\w)(?:\+\d{1,3}|1)[\s.()\-\u2010-\u2015\u2212\u0000]{1,3}\d{3}[\s.\-\u2010-\u2015\u2212\u0000][\dA-Z]{3,7}(?:[\s.\-\u2010-\u2015\u2212\u0000][\dA-Z]{3,4})?(?!\w)/g },
+    { kind: 'ssn',     re: /(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)/g },
+    { kind: 'ein',     re: /(?<!\d)\d{2}-\d{7}(?!\d)/g },
+    // Canadian Business Number: 9 digits + RT/RC/RP/RM/RZ program code +
+    // 4-digit account suffix (e.g. 777129966RT0001). Bracketed under the
+    // existing tax-id chip since it serves the same role as a US EIN.
+    { kind: 'ein',     re: /\b\d{9}\s?(?:RT|RC|RP|RM|RZ)\d{4}\b/g },
+    // International tax/business identifiers (most have a 2-letter country
+    // prefix). EU VAT: GB, DE, FR, IT, ES, NL, etc. Plus UK/IE/AU formats.
+    { kind: 'ein',     re: /\b(?:GB|DE|FR|IT|ES|NL|BE|AT|DK|SE|FI|PL|PT|GR|EL|IE|LU|CY|MT|HR|HU|CZ|SK|RO|BG|EE|LV|LT|SI)\s?\d{8,12}\b/g },
+    // UK NI number: 2 letters + 6 digits + optional letter (AB123456C)
+    { kind: 'ein',     re: /\b[A-CEGHJ-PR-TW-Z]{2}\s?\d{2}\s?\d{2}\s?\d{2}\s?[A-D]?\b/g },
+    // Australian Business Number (ABN): 11 digits with optional spaces
+    { kind: 'ein',     re: /\b\d{2}\s?\d{3}\s?\d{3}\s?\d{3}\b/g },
+    // Generic identifier values that follow a labeled "X ID — value"
+    // construction. Lookbehind locks the match onto the value only, so the
+    // proposal box covers just the random-looking token (Customer ID,
+    // Subscription ID, Order #, Confirmation Number, and similar
+    // identifiers used by SaaS billing surfaces).
+    { kind: 'id',      re: /(?<=(?:Customer|Subscription|Order|Invoice|Account|User|Session|Reference|Ref|Booking|Confirmation|Transaction|Tracking|Member|License|Policy|Contract|Tenant)[\s_-]?(?:ID|Number|#|No\.?|Ref)\s*[—–\-:]+\s*)[A-Za-z0-9_\-]{6,40}\b/gi },
+    { kind: 'cc',      re: /(?<!\d)(?:4\d{3}|5[1-5]\d{2}|3[47]\d{2}|6(?:011|5\d{2}))(?:[\s-]?\d{4}){2,3}(?!\d)/g },
+    // Money: $ (with optional country prefix like CA$, US$, NZ$), £, €, ¥,
+    // or amount + 3-letter currency code, or accounting-parens negative.
+    { kind: 'money',   re: /(?:(?:CA|US|AU|HK|SG|NZ|MX)?\$\s?-?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[£€¥]\s?-?\d{1,3}(?:,\d{3})*(?:\.\d+)?|(?<!\w)-?\d{1,3}(?:,\d{3})*\.\d{2}\s?(?:USD|CAD|EUR|GBP|AUD|JPY|CNY|CHF|INR)\b|\(\$?\d{1,3}(?:,\d{3})*\.\d{2}\))/g },
+    // Street address: house number + 1..5 capitalized words + suffix +
+    // optional direction modifier ("Drive West", "Avenue North", "St NE").
+    // Optional Suite/Apt/Unit/Floor/Office/Bldg/PO Box prefix BEFORE the
+    // street number ("Suite 502 269 David Dunlap Circle") or suffix AFTER
+    // the street type ("100 Main St, Suite 200").
+    { kind: 'address', re: /\b(?:(?:Suite|Ste|Apt|Apartment|Unit|Floor|Fl|Office|Bldg|Building|#|PO\s+Box|Box)\s*[\w-]+[,.\s]+)?\d{1,6}[A-Za-z]?\s+(?:[A-Z][a-zA-Z0-9.'\-]{0,30}\s+){1,5}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Court|Ct|Place|Pl|Way|Terrace|Ter|Circle|Cir|Highway|Hwy|Parkway|Pkwy|Square|Sq|Trail|Trl|Plaza|Plz|Loop|Crescent|Cres)(?:\s+(?:N|S|E|W|NE|NW|SE|SW|North|South|East|West))?(?:[,.\s]+(?:Suite|Ste|Apt|Unit|Floor|Fl|Office|#)\s*[\w-]+)?\b\.?/g },
+    // US: City, State, ZIP — full-span match so the proposal box covers
+    // "San Francisco, CA 94103" entirely (not just "CA 94103"). Allows
+    // periods in city names so "St. Louis, MO 63101" matches.
+    { kind: 'address', re: /\b[A-Z][a-zA-Z.'\-]+(?:\s+[A-Z][a-zA-Z.'\-]+){0,4},?\s+[A-Z]{2}[\s,]+\d{5}(?:-\d{4})?\b/g },
+    // Canadian: City Province PostalCode (e.g., "Markham Ontario L3T 7V9").
+    // Province may be a full name or a 2-letter code. Postal codes are the
+    // letter-digit-letter / digit-letter-digit format with optional space
+    // (or NBSP) between the two halves.
+    { kind: 'address', re: /\b[A-Z][a-zA-Z.'\-]+(?:\s+[A-Z][a-zA-Z.'\-]+){0,3}\s+(?:Ontario|Qu[eé]bec|Alberta|British\s+Columbia|Manitoba|New\s+Brunswick|Nova\s+Scotia|Newfoundland(?:\s+and\s+Labrador)?|Saskatchewan|Yukon|Nunavut|Northwest\s+Territories|Prince\s+Edward\s+Island|AB|BC|MB|NB|NL|NS|NT|NU|ON|PE|QC|SK|YT)\s+[A-Z]\d[A-Z][\s ]?\d[A-Z]\d\b/g },
+    // Suffix-FIRST street address (French / Spanish / Italian / Portuguese /
+    // some Eastern European): house number → suffix word → street name.
+    // Examples: "66 Avenue des Champs-Élysées", "25 Calle Mayor",
+    // "100 Via del Corso", "10 Rua Augusta", "5 Carrer de Mallorca".
+    { kind: 'address', re: /\b\d{1,6}[A-Za-z]?\s+(?:Avenue|Av\.?|Rue|Bd|Boulevard|Boul\.?|Chemin|Ch\.?|Place|Pl\.?|Quai|All[ée]e|Impasse|Imp\.?|Cours|Promenade|Voie|Pont|Esplanade|Faubourg|Square|Galerie|Passage|Parvis|Sentier|Villa|Calle|C\/|Avenida|Avda\.?|Plaza|Plz|Carrer|Carretera|Ctra|Paseo|P[ºo°]|Camino|Cmno|Glorieta|Ronda|Travesía|Travesia|Via|Viale|V\.le|Vle|Piazza|P\.zza|Corso|C\.so|Largo|Vicolo|Vco|Lungotevere|Strada|Stradone|Rua|Travessa|Trav\.?|Estrada|Pra[çc]a|Beco|Largo|Ulica|Ul\.?|Aleja|Al\.?|Plac)\s+[a-zA-ZÀ-ÿ'\-][a-zA-ZÀ-ÿ0-9.'\- ]{2,60}[a-zA-ZÀ-ÿ]\b/gu },
+    // German / Dutch / Scandinavian concatenated-suffix format: street name
+    // ends with a recognized suffix (Straße/-str./-weg/-platz/-allee/-gasse
+    // for German, -straat/-laan/-plein/-weg/-kade for Dutch, -gata/-gatan
+    // for Swedish/Norwegian), house number AFTER the name.
+    // Examples: "Hauptstraße 5", "Damrak 70", "Drottninggatan 14".
+    { kind: 'address', re: /\b[A-ZÀ-Ý][a-zA-ZÀ-ÿ\-]+(?:stra(?:ß|ss)e|str\.?|weg|platz|pl\.|allee|gasse|gosse|ring|ufer|markt|berg|hof|tor|straat|laan|plein|kade|gracht|singel|dijk|gata|gatan|gade|plassen|veien|vej|plads)\s+\d{1,5}[A-Za-z]?\b/gu },
+    // Country name on its own line (or anywhere) — completes a postal block.
+    // Includes English + native-language names for major countries.
+    { kind: 'address', re: /\b(?:Canada|United\s+States(?:\s+of\s+America)?|USA|U\.S\.A\.|U\.S\.|UK|United\s+Kingdom|Great\s+Britain|England|Scotland|Wales|Northern\s+Ireland|Mexico|M[ée]xico|Australia|Germany|Deutschland|France|Spain|Espa[ñn]a|Italy|Italia|Netherlands|Nederland|India|Bh[āa]rat|China|Zhongguo|Japan|Nippon|Nihon|Brazil|Brasil|Argentina|New\s+Zealand|Aotearoa|Ireland|[ÉE]ire|Belgium|Belgique|Belgi[ëe]|Austria|[ÖO]sterreich|Switzerland|Suisse|Schweiz|Svizzera|Sweden|Sverige|Norway|Norge|Denmark|Danmark|Finland|Suomi|Portugal|Greece|Hellas|Israel|Singapore|Hong\s+Kong|South\s+Africa|Poland|Polska|Czech(?:\s+Republic)?|[ČC]esko|Hungary|Magyarorsz[áa]g|Russia|Rossiya|Turkey|T[üu]rkiye|UAE|United\s+Arab\s+Emirates|Saudi\s+Arabia|Egypt|Mi[şs]r|Nigeria|Kenya|Morocco|Maroc|Algeria|Tunisia|South\s+Korea|Korea|Vietnam|Thailand|Indonesia|Philippines|Malaysia|Pakistan|Bangladesh|Sri\s+Lanka|Chile|Peru|Colombia|Venezuela|Ecuador|Uruguay|Bolivia|Paraguay|Iceland|Luxembourg|Liechtenstein|Monaco|Iceland)\b/g },
+    // Standalone Suite/Apt/Unit/Floor/Building/PO Box on its own — useful
+    // when "Suite 502" sits on a line by itself between the street and the
+    // city/postal lines. The merge step then folds it into one address rect.
+    // Unit identifier restricted to digits + uppercase to avoid matching
+    // things like "Floor mat" or "Box of pens".
+    { kind: 'address', re: /\b(?:Suite|Ste|Apt|Apartment|Unit|Floor|Fl|Office|Bldg|Building|PO\s+Box|Box)\s*#?\s*[\dA-Z]{1,5}\b/g },
+    // Bare ZIP (with state) for one-off cases — "Mail to NY 10001".
+    { kind: 'zip',     re: /\b[A-Z]{2}[\s,]+\d{5}(?:-\d{4})?\b/g },
+    // International postal codes — anchored to a known country/region word
+    // OR to common postal-code shapes that are unique enough to not
+    // collide with other digit clusters.
+    //   - UK:    SW1A 1AA, M1 1AA, EC1A 1BB, B33 8TH (1-2 letters, 1-2
+    //            digits, optional letter, space, digit, 2 letters)
+    //   - NL:    1234 AB
+    //   - DE/FR/ES/IT: 5 digits (anchored on a country word so the regex
+    //            doesn't grab arbitrary 5-digit clusters)
+    //   - JP:    100-0000 or 1000000 (7 digits, ambiguous standalone)
+    //   - AU:    4 digits (ambiguous standalone)
+    { kind: 'zip',     re: /\b[A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2}\b/g },     // UK
+    { kind: 'zip',     re: /\b\d{4}\s?[A-Z]{2}\b(?!\d)/g },                  // NL
+    { kind: 'zip',     re: /\b(?:Germany|Deutschland|France|Spain|España|Italy|Italia|Portugal|Belgium|Belgique|Switzerland|Suisse|Schweiz|Austria|[A-ZÀ-Ý][a-zA-ZÀ-ÿ\- ]{2,30}),?\s+\d{5}\b/g }, // 5-digit EU with country anchor
+  ];
+
+  async function autoDetect() {
+    if (!state.pages.length) return;
+    $autoBtn.disabled = true;
+    showResult('', 'clear');
+
+    // Drop any previous pending rects (and their toggled-off chip state) so
+    // re-running auto-detect is fully idempotent.
+    state.disabledKinds.clear();
+    for (const p of state.pages) {
+      const before = p.rects.length;
+      p.rects = p.rects.filter(r => !r.pending);
+      if (p.rects.length !== before) renderRects(p);
+    }
+
+    const totals = {};
+    let pageHits = 0;
+    // Power-user diagnostic. Inspect window.xjmaniLastDetect in devtools to
+    // see exactly what text was extracted from each page and what each regex
+    // matched, useful for debugging missed PII.
+    const debug = { pages: [] };
+
+    for (const p of state.pages) {
+      const tc = await p.page.getTextContent();
+      const lines = groupItemsIntoLines(tc.items);
+      const pageDebug = { pageNum: p.pageNum, lines: [] };
+      let pageHit = false;
+
+      for (const line of lines) {
+        const { joined, itemStarts } = buildJoinedLine(line);
+        if (!joined.trim()) continue;
+        const lineDebug = { joined, matches: [] };
+
+        const lineMatches = [];
+        for (const { kind, re } of PII_PATTERNS) {
+          re.lastIndex = 0;
+          let m;
+          while ((m = re.exec(joined)) !== null) {
+            const matchStr = m[0];
+            if (kind === 'cc' && !luhnValid(matchStr.replace(/[\s-]/g, ''))) continue;
+            lineMatches.push({ kind, start: m.index, end: m.index + matchStr.length, str: matchStr });
+            lineDebug.matches.push({ kind, str: matchStr });
+            // Avoid infinite loop on zero-length matches.
+            if (m.index === re.lastIndex) re.lastIndex++;
+          }
+        }
+        // ALSO run any user-defined custom patterns. Each pattern gets its
+        // own kind ("cust-{id}") so it shows up as its own chip in the
+        // pending bar, separately togglable via the chip filter.
+        for (const cp of state.customPatterns) {
+          let cre;
+          try { cre = new RegExp(cp.regex, 'g'); } catch { continue; }
+          const kind = `cust-${cp.id}`;
+          let m;
+          while ((m = cre.exec(joined)) !== null) {
+            const matchStr = m[0];
+            if (!matchStr) { cre.lastIndex++; continue; }
+            lineMatches.push({ kind, start: m.index, end: m.index + matchStr.length, str: matchStr });
+            lineDebug.matches.push({ kind, str: matchStr });
+            if (m.index === cre.lastIndex) cre.lastIndex++;
+          }
+        }
+        pageDebug.lines.push(lineDebug);
+        if (lineMatches.length === 0) continue;
+
+        // De-overlap: if two patterns matched the same span, prefer the
+        // longer one (so a "100 Main St, Suite 200" street match beats the
+        // shorter standalone "Suite 200" match that overlaps it). Sort by
+        // start ascending, then by length descending. Any later match that
+        // overlaps an already-claimed range is dropped.
+        lineMatches.sort((a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start));
+        const claimed = [];
+        for (const lm of lineMatches) {
+          if (claimed.some(c => lm.start < c.end && lm.end > c.start)) continue;
+          claimed.push(lm);
+          const [firstIdx, lastIdx] = mapMatchToItems(lm.start, lm.end - 1, line, itemStarts);
+          if (firstIdx < 0 || lastIdx < 0) continue;
+          const rects = [];
+          for (let k = firstIdx; k <= lastIdx; k++) {
+            const r = itemToViewportRect(line[k], p.viewport);
+            if (r) rects.push(r);
+          }
+          if (rects.length === 0) continue;
+          const u = unionRects(rects);
+          // Skip if this region is already committed-redacted on this page —
+          // re-running auto-detect after the user accepted some proposals
+          // shouldn't re-propose what's already been redacted (otherwise the
+          // committed-count balloons on each re-run).
+          const alreadyCommitted = p.rects.some(r =>
+            !r.pending && rectOverlapRatio(u, r) >= 0.5
+          );
+          if (alreadyCommitted) continue;
+          p.rects.push({
+            id: state.nextRectId++,
+            x: u.x, y: u.y, w: u.w, h: u.h,
+            pending: true,
+            kind: lm.kind,
+          });
+          totals[lm.kind] = (totals[lm.kind] || 0) + 1;
+          pageHit = true;
+        }
+      }
+      if (pageHit) {
+        // Multi-line postal addresses produce two adjacent rects (street
+        // line + city/state/zip line). Merge them into one proposal so the
+        // user sees and accepts the address as a single block.
+        p.rects = mergeAdjacentAddressRects(p.rects);
+        pageHits++;
+        renderRects(p);
+      }
+      debug.pages.push(pageDebug);
+    }
+
+    window.xjmaniLastDetect = debug;
+
+    // Unconditional diagnostic logs so what auto-detect saw and captured
+    // is always visible. Open DevTools → Console after running.
+    const allLines = debug.pages.flatMap(pg => pg.lines);
+    console.log('[xjmani-redactor] auto-detect run:', {
+      totals,
+      pages: debug.pages.length,
+      totalLines: allLines.length,
+    });
+    console.log('[xjmani-redactor] all extracted lines (first 60):');
+    allLines.slice(0, 60).forEach(l => console.log('  ' + JSON.stringify(l.joined)));
+
+    function dumpSuspect(label, predicate, captured) {
+      const suspect = allLines.filter(l => predicate(l.joined));
+      console.log(`[xjmani-redactor] ${label} suspects: ${suspect.length} matched the loose pattern, ${captured} were actually captured.`);
+      if (suspect.length > captured) {
+        suspect.slice(0, 10).forEach(l => console.log('    UNMATCHED ' + JSON.stringify(l.joined)));
+      }
+    }
+    dumpSuspect('phone',
+      // Loose predicate: any line whose digit count looks phone-shaped
+      // (10-15 consecutive-or-near-consecutive digits in a span < 30 chars).
+      // This catches NUL-separated, exotic-Unicode, and other formats that
+      // the strict regex might miss.
+      s => {
+        const m = s.match(/[\d\s.()\-‐-―−\u0000+]{10,30}/g);
+        if (!m) return false;
+        return m.some(span => (span.replace(/\D/g, '').length >= 10));
+      },
+      totals.phone || 0);
+    dumpSuspect('address',
+      s => /\b[A-Z]{2}[\s,]+\d{5}\b/.test(s) ||                         // US: ST 12345
+           /\b[A-Z]\d[A-Z][\s ]?\d[A-Z]\d\b/.test(s) ||           // Canadian postal
+           /\b\d+\s+\w[\w\s.'\-]*\s+(?:Street|St|Ave|Avenue|Road|Rd|Blvd|Drive|Dr|Lane|Ln|Circle|Cir|Way|Place|Pl|Ct|Court|Crescent|Cres)\b/i.test(s) ||
+           /\b(?:Suite|Apt|Unit|Floor|Ste|Bldg|Building|PO\s+Box)\b/i.test(s),
+      totals.address || 0);
+
+    updateCount();
+    // Stay disabled after a successful run — re-running gives identical
+    // results with the same regex set, so the only useful next step is to
+    // clear and try again. Re-enabled by clear or by loading a new PDF.
+    setAutoEnabled(false);
+
+    const summary = Object.entries(totals)
+      .filter(([_, n]) => n > 0)
+      .map(([k, n]) => `${n} ${PII_LABELS[k]}${n === 1 ? '' : 's'}`)
+      .join(', ');
+
+    if (!summary) {
+      showResult('Auto-detect found nothing the regex patterns recognize. Try drawing manually, or check that the PDF text is selectable.', 'warn');
+    } else {
+      // No success banner — the yellow pending bar already shows the count
+      // and the type chips, so a green banner saying the same is redundant.
+      showResult('', 'clear');
+    }
+  }
+
+  // Group items into visual lines. PDF coords have y increasing upward, so
+  // items sharing y (within a tolerance) are on the same line. Within a
+  // line, sort by ascending x for reading order. We additionally split a
+  // logical line wherever there's a large horizontal gap between adjacent
+  // items, so two-column invoice layouts (sender on the left, customer on
+  // the right at the same y) don't get merged into one nonsense string.
+  function groupItemsIntoLines(items) {
+    const enriched = items
+      .filter(it => it && typeof it.str === 'string' && it.str.length > 0)
+      .map(it => ({ it, y: it.transform[5], x: it.transform[4], w: it.width || 0, h: it.height || 12 }));
+    if (enriched.length === 0) return [];
+    enriched.sort((a, b) => {
+      if (Math.abs(a.y - b.y) > Math.max(2, a.h * 0.5)) return b.y - a.y;
+      return a.x - b.x;
+    });
+
+    const lines = [];
+    let cur = [];
+    let curY = null;
+    let curH = 0;
+    let lastEndX = null;
+    for (const o of enriched) {
+      const tol = Math.max(2, Math.max(curH, o.h) * 0.5);
+      const sameLine = curY !== null && Math.abs(o.y - curY) <= tol;
+      // Column break threshold: ~2.5 line heights. Within a column, gaps
+      // between items are typically a fraction of the line height (single
+      // word spacing). Between columns, gaps are typically 30+ user units.
+      const colGap = Math.max(curH, o.h, 12) * 2.5;
+      const columnBreak = sameLine && lastEndX !== null && (o.x - lastEndX) > colGap;
+
+      if (sameLine && !columnBreak) {
+        cur.push(o.it);
+        curY = (curY * (cur.length - 1) + o.y) / cur.length;
+        curH = Math.max(curH, o.h);
+        lastEndX = o.x + o.w;
+      } else {
+        if (cur.length) lines.push(cur);
+        cur = [o.it];
+        curY = o.y;
+        curH = o.h;
+        lastEndX = o.x + o.w;
+      }
+    }
+    if (cur.length) lines.push(cur);
+    return lines;
+  }
+
+  // Build a joined-line string with gap-aware spacing. If two adjacent items
+  // are visually contiguous (no horizontal gap), join with no separator so
+  // patterns like "user@example.com" stitch back together. If there's a real
+  // visual gap, insert a single space.
+  function buildJoinedLine(items) {
+    let joined = '';
+    const itemStarts = [];
+    let prevEndX = null;
+    let prevAvgChar = 0;
+    for (const it of items) {
+      const startX = it.transform[4];
+      if (prevEndX !== null) {
+        const gap = startX - prevEndX;
+        if (gap > prevAvgChar * 0.4) joined += ' ';
+      }
+      itemStarts.push(joined.length);
+      joined += it.str;
+      const w = it.width || 0;
+      prevEndX = startX + w;
+      prevAvgChar = it.str.length > 0 ? w / it.str.length : prevAvgChar;
+    }
+    return { joined, itemStarts };
+  }
+
+  // Given match start/end (in joined-string char indices), return the index
+  // range of items the match spans.
+  function mapMatchToItems(matchStart, matchEnd, items, itemStarts) {
+    let firstIdx = -1, lastIdx = -1;
+    for (let k = 0; k < items.length; k++) {
+      const start = itemStarts[k];
+      const end   = start + items[k].str.length;
+      if (matchStart < end && matchStart >= start) firstIdx = k;
+      if (matchEnd   < end && matchEnd   >= start) lastIdx  = k;
+    }
+    if (firstIdx === -1) {
+      // Match starts before any item begin; clamp to first.
+      for (let k = 0; k < items.length; k++) {
+        if (itemStarts[k] >= matchStart) { firstIdx = k; break; }
+      }
+      if (firstIdx === -1) firstIdx = 0;
+    }
+    if (lastIdx === -1) {
+      // Match extends beyond the last item start; clamp to last.
+      for (let k = items.length - 1; k >= 0; k--) {
+        const end = itemStarts[k] + items[k].str.length;
+        if (matchEnd < end) { lastIdx = k; break; }
+      }
+      if (lastIdx === -1) lastIdx = items.length - 1;
+    }
+    if (lastIdx < firstIdx) lastIdx = firstIdx;
+    return [firstIdx, lastIdx];
+  }
+
+  function mergeAdjacentAddressRects(rects) {
+    // Walk pending address-family rects (kind 'address' OR 'zip') top-to-
+    // bottom; if two are vertically adjacent (gap < ~1 line height) and
+    // roughly left-aligned, merge their bboxes into one. Recomputes the
+    // chain greedily so a 3-line block (street / city-state-zip / country)
+    // collapses into a single proposal — even when one of the lines was
+    // tagged as ZIP rather than ADDRESS (e.g. EU "France 75008" patterns).
+    // A merged block always reads as ADDRESS; standalone ZIPs that don't
+    // merge with anything keep their ZIP kind.
+    const addrs = rects
+      .filter(r => r.pending && (r.kind === 'address' || r.kind === 'zip'))
+      .sort((a, b) => a.y - b.y);
+    if (addrs.length < 2) return rects;
+
+    const removed = new Set();
+    for (let i = 0; i < addrs.length; i++) {
+      const cur = addrs[i];
+      if (removed.has(cur.id)) continue;
+      for (let j = i + 1; j < addrs.length; j++) {
+        const next = addrs[j];
+        if (removed.has(next.id)) continue;
+        const gap = next.y - (cur.y + cur.h);
+        const lh = Math.max(cur.h, next.h);
+        const aligned = Math.abs(next.x - cur.x) < lh * 2.5;
+        if (gap < lh * 1.2 && gap > -lh * 0.5 && aligned) {
+          const x1 = Math.min(cur.x, next.x);
+          const y1 = Math.min(cur.y, next.y);
+          const x2 = Math.max(cur.x + cur.w, next.x + next.w);
+          const y2 = Math.max(cur.y + cur.h, next.y + next.h);
+          cur.x = x1; cur.y = y1; cur.w = x2 - x1; cur.h = y2 - y1;
+          // Multi-line block: pill reads as ADDRESS regardless of which
+          // pattern fired on each line.
+          cur.kind = 'address';
+          removed.add(next.id);
+        } else if (gap > lh * 1.5) {
+          break;
+        }
+      }
+    }
+    return rects.filter(r => !removed.has(r.id));
+  }
+
+  function unionRects(rects) {
+    let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+    for (const r of rects) {
+      if (r.x < x1) x1 = r.x;
+      if (r.y < y1) y1 = r.y;
+      if (r.x + r.w > x2) x2 = r.x + r.w;
+      if (r.y + r.h > y2) y2 = r.y + r.h;
+    }
+    return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+  }
+
+  // Fraction of `a`'s area that lies inside `b`. 1 = a is fully inside b.
+  // Used to detect that a freshly-proposed rect duplicates an already-
+  // committed redaction so it can be skipped on a re-run of auto-detect.
+  function rectOverlapRatio(a, b) {
+    const xOverlap = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
+    const yOverlap = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+    if (xOverlap === 0 || yOverlap === 0) return 0;
+    const aArea = a.w * a.h;
+    return aArea > 0 ? (xOverlap * yOverlap) / aArea : 0;
+  }
+
+  function luhnValid(digits) {
+    if (digits.length < 13 || digits.length > 19) return false;
+    let sum = 0, alt = false;
+    for (let i = digits.length - 1; i >= 0; i--) {
+      const d = digits.charCodeAt(i) - 48;
+      if (d < 0 || d > 9) return false;
+      const v = alt ? (d * 2 > 9 ? d * 2 - 9 : d * 2) : d;
+      sum += v;
+      alt = !alt;
+    }
+    return sum % 10 === 0;
+  }
+
+  function itemToViewportRect(item, viewport) {
+    const [, , , d, e, f] = item.transform;
+    const w = item.width;
+    const h = item.height || Math.abs(d) || 12;
+    const [x1, y1] = viewport.convertToViewportPoint(e, f + h);
+    const [x2, y2] = viewport.convertToViewportPoint(e + w, f);
+    const x = Math.min(x1, x2);
+    const y = Math.min(y1, y2);
+    const rw = Math.max(2, Math.abs(x2 - x1));
+    const rh = Math.max(2, Math.abs(y2 - y1));
+    return { x, y, w: rw, h: rh };
+  }
+
+  // ---- toast + verify hooks ----------------------------------------------
+  const $toast    = document.getElementById('toast');
+  const $toastMsg = document.getElementById('toastMsg');
+  let toastTimer = null;
+  function toast(msg) {
+    $toastMsg.textContent = msg;
+    $toast.classList.add('is-visible');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => $toast.classList.remove('is-visible'), 5500);
+  }
+  document.querySelectorAll('[data-verify]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const map = {
+        network:   'F12 → Network tab → upload a PDF and redact. Nothing fires after page load.',
+        redaction: 'Open the export in any PDF reader, press Ctrl+F, search for what you redacted. Gone.',
+        storage:   'F12 → Application → Storage. Only your custom regex patterns are stored, on this device only.',
+      };
+      toast(map[btn.dataset.verify] || 'Open devtools to verify.');
+    });
+  });
+</script>
+
+<div class="toast" id="toast" role="status" aria-live="polite">
+  <span class="toast__dot" aria-hidden="true"></span>
+  <span id="toastMsg"></span>
+</div>
+
+</body>
+</html>

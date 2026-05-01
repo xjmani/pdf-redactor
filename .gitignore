@@ -1,0 +1,23 @@
+# node
+node_modules/
+.pnp.*
+.yarn/
+
+# build output
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# env
+.env*
+!.env.example
+
+# os / editor
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# logs
+*.log
