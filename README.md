@@ -24,6 +24,12 @@ There is no backend. After the page loads, no network requests are made. Open De
 2. **Download the standalone HTML:** clone this repo (or grab the zip) and open `index.html`. Libraries are vendored under `vendor/`, so no internet is required after that
 3. **Self-host:** drop `index.html` and `vendor/` on any static host (NAS, intranet, SharePoint). Anyone who can reach the page can use it without bytes leaving the network
 
+## Self-host
+
+Drop `index.html` and `vendor/` on any static file host: NAS, SharePoint, internal wiki, or any HTTP server you control. The page runs entirely in the browser, so anyone who can reach the URL can redact PDFs without bytes leaving your network.
+
+No build step. No server runtime. The Content-Security-Policy meta tag in `index.html` already locks the page to its own origin, blocking any accidental external fetch.
+
 ## Privacy
 
 - No uploads, ever

@@ -289,12 +289,6 @@
   [data-theme="dark"] .theme-tog .moon,
   [data-theme="light"] .theme-tog .sun { display: none; }
 
-  @media (max-width: 540px) {
-    /* Collapse the middle "tools" crumb on narrow screens; brand and
-       current-page slug stay so users still know where they are. */
-    .hdr__crumb--mid,
-    .hdr__crumb-sep--mid { display: none; }
-  }
 
   /* ==========================================================
      HERO
@@ -1367,19 +1361,6 @@
     flex-wrap: wrap;
     line-height: 1.4;
   }
-  .ftr__live {
-    width: 7px; height: 7px;
-    border-radius: 999px;
-    background: var(--green);
-    box-shadow: 0 0 0 0 var(--green-glow);
-    animation: ftr-pulse 2.4s var(--ease) infinite;
-    display: inline-block;
-    flex-shrink: 0;
-  }
-  @keyframes ftr-pulse {
-    0%, 100% { box-shadow: 0 0 0 0 var(--green-glow); }
-    50%      { box-shadow: 0 0 0 5px transparent; }
-  }
   .ftr__brand-mini {
     color: var(--text);
     font-weight: 600;
@@ -1392,19 +1373,9 @@
   .ftr__inner a {
     color: var(--text-dim);
     transition: color .2s var(--ease);
-    display: inline-flex;
-    align-items: center;
-    gap: .25rem;
     text-decoration: none;
   }
-  .ftr__inner a[data-ext]::after {
-    content: '↗';
-    font-size: 10px;
-    color: var(--text-mute);
-    transition: transform .2s var(--ease), color .2s var(--ease);
-  }
   .ftr__inner a:hover { color: var(--text); }
-  .ftr__inner a[data-ext]:hover::after { color: var(--green); transform: translate(1px, -1px); }
   .ftr__spacer { margin-left: auto; }
   @media (max-width: 720px) {
     .ftr__spacer { margin-left: 0; flex-basis: 100%; height: 0; }
@@ -1881,7 +1852,7 @@
         <span class="accent">losing the rest.</span>
       </h1>
       <p class="hero__sub">
-        Most online redactors slap a black box on top of the text. The text is still in the file, ready to be copy-pasted out. We <strong>actually remove the targeted content from the PDF</strong>, then paint the box on for visual confirmation. Everything outside the redaction stays as native, selectable text. Nothing is uploaded.
+        Your redacted PDF stays selectable and searchable. Targeted text is removed from the file, not hidden under a box.
       </p>
 
       <div class="drop" id="drop" data-active="false" tabindex="0" role="button" aria-label="Drop a PDF here or click to browse">
@@ -1911,7 +1882,7 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
         </svg>
-        <span><strong>Zero uploads.</strong> The file is opened, parsed, and redacted entirely in your browser. Open devtools and watch the network tab; you'll see nothing leave.</span>
+        <span><strong>Zero uploads.</strong> Parsed and redacted entirely in your browser.</span>
       </div>
     </div>
   </section>
@@ -2023,25 +1994,24 @@
       <div class="section__head">
         <span class="section__eyebrow">verify it yourself</span>
         <h2 class="section__title">Privacy as an instrument, not a claim.</h2>
-        <p class="section__lede">Your PDFs never leave the tab. Every claim below is something you can confirm in your own browser before you trust this tool with anything sensitive.</p>
       </div>
       <div class="proof">
         <article class="proof__item">
           <span class="proof__num">01</span>
           <h3 class="proof__title">No uploads</h3>
-          <p class="proof__body">Parsing and content-stream rewriting both run in your browser, using pdfjs-dist and pdf-lib. Open devtools, switch to the Network tab, redact a file: nothing fires. Bytes never leave this device.</p>
+          <p class="proof__body">Parsing and content-stream rewriting both run in your browser, using pdfjs-dist and pdf-lib. Bytes never leave this device.</p>
           <button class="proof__verify" type="button" data-verify="network">F12 &rarr; Network &rarr; redact &rarr;</button>
         </article>
         <article class="proof__item">
           <span class="proof__num">02</span>
           <h3 class="proof__title">Real redaction, not a sticker</h3>
-          <p class="proof__body">Most browser redactors paint a black box on top of the text and call it done. The text is still in the file, ready to be copy-pasted out. We rewrite the page content stream to actually remove the targeted glyphs, then paint the box on for visual confirmation.</p>
+          <p class="proof__body">A black box on top leaves selectable text underneath. We strip the targeted glyphs from the content stream, then paint the box on for visual confirmation.</p>
           <button class="proof__verify" type="button" data-verify="redaction">Open the export, search for it &rarr;</button>
         </article>
         <article class="proof__item">
           <span class="proof__num">03</span>
           <h3 class="proof__title">No tracking</h3>
-          <p class="proof__body">No analytics, no cookies, no fingerprinting. Custom regex patterns persist in localStorage on this device only. The PDF you opened lives in JS memory until you close the tab.</p>
+          <p class="proof__body">No analytics, cookies, or fingerprinting. Custom regex patterns live in localStorage on this device. The opened PDF lives in JS memory until you close the tab.</p>
           <button class="proof__verify" type="button" data-verify="storage">F12 &rarr; Application &rarr; Storage &rarr;</button>
         </article>
       </div>
@@ -2056,7 +2026,6 @@
       <div class="section__head">
         <span class="section__eyebrow">run it offline</span>
         <h2 class="section__title">Don't trust the page. Take it home.</h2>
-        <p class="section__lede">A single HTML file you can drop on a USB stick. A static asset you can self-host on your intranet. The full source under MIT. Pick your level of paranoia.</p>
       </div>
       <div class="home__grid">
         <article class="home__card">
@@ -2067,8 +2036,8 @@
             <span class="home__label">single file</span>
           </div>
           <h3 class="home__title">Standalone HTML</h3>
-          <p class="home__desc"><code style="font-family:var(--font-mono);font-size:.92em;color:var(--text)">index.html</code> plus a <code style="font-family:var(--font-mono);font-size:.92em;color:var(--text)">vendor/</code> folder with pdfjs and pdf-lib bundled in. Drop the pair on a thumb drive, double-click, redact PDFs with no network at all. Content-Security-Policy locks the page to its own origin so it can't phone home even if a future change tried.</p>
-          <a class="home__cta" href="https://github.com/xjmani/pdf-redactor/archive/refs/heads/main.zip" target="_blank" rel="noopener" id="downloadHtml">Download (.zip) &rarr;</a>
+          <p class="home__desc"><code style="font-family:var(--font-mono);font-size:.92em;color:var(--text)">index.html</code> plus pdfjs and pdf-lib in <code style="font-family:var(--font-mono);font-size:.92em;color:var(--text)">vendor/</code>. Double-click to redact PDFs with no network at all.</p>
+          <a class="home__cta" href="https://github.com/xjmani/pdf-redactor/archive/refs/heads/main.zip" id="downloadHtml">Download (.zip) &rarr;</a>
         </article>
 
         <article class="home__card">
@@ -2079,8 +2048,8 @@
             <span class="home__label">self-host</span>
           </div>
           <h3 class="home__title">Run it on your network</h3>
-          <p class="home__desc">Serve <code style="font-family:var(--font-mono);font-size:.92em;color:var(--text)">index.html</code> from your NAS, SharePoint, internal wiki, or any static host. Anyone who can reach the page can redact PDFs without bytes leaving your network.</p>
-          <a class="home__cta" href="https://github.com/xjmani/pdf-redactor#self-host" target="_blank" rel="noopener">Self-host guide &rarr;</a>
+          <p class="home__desc">Serve <code style="font-family:var(--font-mono);font-size:.92em;color:var(--text)">index.html</code> from your NAS, SharePoint, internal wiki, or any static host. Bytes never leave your network.</p>
+          <a class="home__cta" href="https://github.com/xjmani/pdf-redactor#self-host">Self-host guide &rarr;</a>
         </article>
 
         <article class="home__card">
@@ -2091,8 +2060,8 @@
             <span class="home__label">open source</span>
           </div>
           <h3 class="home__title">View source</h3>
-          <p class="home__desc">Every line of code, MIT-licensed, on GitHub. Audit the redaction logic, fork the regex pack, extend it with your own patterns. Issues and PRs welcome.</p>
-          <a class="home__cta" href="https://github.com/xjmani/pdf-redactor" target="_blank" rel="noopener">github.com/xjmani/pdf-redactor &rarr;</a>
+          <p class="home__desc">MIT-licensed source on GitHub. Audit the logic, fork the regex pack, extend with your own patterns.</p>
+          <a class="home__cta" href="https://github.com/xjmani/pdf-redactor">github.com/xjmani/pdf-redactor &rarr;</a>
         </article>
       </div>
     </div>
@@ -2127,21 +2096,13 @@
 
 <footer class="ftr">
   <div class="container ftr__inner">
-    <span class="ftr__live" aria-hidden="true"></span>
     <span class="ftr__brand-mini"><span class="x">x</span>jmani</span>
-    <span class="ftr__sep">·</span>
-    <span>Privacy-first browser tools</span>
-    <span class="ftr__sep">·</span>
-    <span>Client-only</span>
-    <span class="ftr__sep">·</span>
-    <span>MIT</span>
     <span class="ftr__sep">·</span>
     <span>&copy; 2026 Loyaltydraw.com Inc</span>
     <span class="ftr__spacer" aria-hidden="true"></span>
-    <a href="https://github.com/xjmani/pdf-redactor" target="_blank" rel="noopener" data-ext id="ghLink">github</a>
-    <a href="https://xjmani.com/legal/privacy" data-ext>Privacy</a>
-    <a href="https://xjmani.com/contact" data-ext>Contact</a>
-    <a href="https://xjmani.com" data-ext>xjmani.com</a>
+    <a href="https://github.com/xjmani/pdf-redactor" id="ghLink">GitHub</a>
+    <a href="https://xjmani.com/legal/privacy">Privacy</a>
+    <a href="https://xjmani.com/contact">Contact</a>
   </div>
 </footer>
 
